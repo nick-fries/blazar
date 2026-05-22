@@ -482,3 +482,155 @@ class BlazarPlacementClient(object):
             LOG.info("Resource class %s doesn't exist or there is no "
                      "inventory for that resource class on resource provider "
                      "%s. Skipped the deletion", rc_name, rp_name)
+    # ------------------------------------------------------------------
+    # Topology-aware reservation helpers
+    #
+    # These methods support pre-flight feasibility checks at reservation
+    # creation time. They read the Placement resource provider tree for
+    # a candidate compute host and summarise inventory, traits, and
+    # topology anchors across all sub-RPs (PCI device RPs Nova writes,
+    # accelerator RPs Cyborg writes, NIC RPs Neutron writes, plus the
+    # socket/NUMA anchor sub-RPs the topology-aware Cyborg driver writes).
+    #
+    # Nothing here writes Placement state. Item 3 (Placement reservation
+    # holds) is intentionally not implemented.
+    # ------------------------------------------------------------------
+
+    def get_host_rp_tree(self, host_name):
+        """Read the full RP subtree rooted at the compute host.
+
+        :param host_name: hypervisor_hostname (matches the Nova root RP name)
+        :return: dict keyed by rp_uuid with entries
+                 {'uuid', 'name', 'parent_uuid', 'traits' (list of str),
+                  'inventory' (dict resource_class -> inventory record)}
+                 If the host RP is not found, returns {}.
+        """
+        host_rp = self.get_resource_provider(host_name)
+        if host_rp is None:
+            return {}
+
+        host_uuid = host_rp['uuid']
+        # in_tree=<host_uuid> returns the root and all descendants.
+        # Placement microversion 1.14+ supports in_tree; we pin 1.29
+        # which is well above that.
+        rps = self.list_resource_providers(
+            query="in_tree=%s" % host_uuid)
+
+        tree = {}
+        for rp in rps:
+            rp_uuid = rp['uuid']
+            try:
+                inv = self.get_inventory(rp_uuid).get('inventories', {})
+            except exceptions.ResourceProviderNotFound:
+                inv = {}
+            try:
+                traits = self.get_traits(rp_uuid)
+            except exceptions.ResourceProviderNotFound:
+                traits = []
+            tree[rp_uuid] = {
+                'uuid': rp_uuid,
+                'name': rp.get('name'),
+                'parent_uuid': rp.get('parent_provider_uuid'),
+                'traits': list(traits),
+                'inventory': inv,
+            }
+        return tree
+
+    def get_allocations_for_rp(self, rp_uuid):
+        """Return total used per resource class on a single RP.
+
+        :param rp_uuid: RP UUID
+        :return: dict resource_class -> used (int)
+        """
+        url = '/resource_providers/%s/usages' % rp_uuid
+        resp = self.get(url)
+        if not resp:
+            return {}
+        return resp.json().get('usages', {}) or {}
+
+    @staticmethod
+    def _rp_is_blazar_reservation(rp_entry):
+        """True if the RP is a Blazar reservation sub-RP.
+
+        Blazar's existing code creates 'blazar_<host_name>' sub-RPs to
+        hold CUSTOM_RESERVATION_<uuid> inventory. We must exclude these
+        from accelerator-availability accounting because they don't
+        represent real hardware.
+        """
+        name = (rp_entry.get('name') or '')
+        return name.startswith('blazar_')
+
+    def get_accelerator_inventory_for_host(self, host_name,
+                                           resource_classes,
+                                           rp_tree=None):
+        """Sum accelerator inventory and usage across the host RP subtree.
+
+        :param host_name: hypervisor_hostname (used only if rp_tree is None)
+        :param resource_classes: iterable of resource class names to sum
+        :param rp_tree: optional pre-fetched RP tree from
+                        :py:meth:`get_host_rp_tree`
+        :return: dict resource_class -> {'total': int, 'used': int}.
+                 Blazar's own blazar_<host> reservation RPs are excluded.
+                 Resource classes absent from the tree report
+                 {'total': 0, 'used': 0}.
+        """
+        if rp_tree is None:
+            rp_tree = self.get_host_rp_tree(host_name)
+
+        result = {rc: {'total': 0, 'used': 0} for rc in resource_classes}
+        for rp_uuid, rp_entry in rp_tree.items():
+            if self._rp_is_blazar_reservation(rp_entry):
+                continue
+            inv = rp_entry.get('inventory', {})
+            usages = None
+            for rc in resource_classes:
+                if rc in inv:
+                    total = inv[rc].get('total', 0)
+                    reserved = inv[rc].get('reserved', 0)
+                    result[rc]['total'] += max(0, int(total) - int(reserved))
+                    if usages is None:
+                        usages = self.get_allocations_for_rp(rp_uuid)
+                    result[rc]['used'] += int(usages.get(rc, 0))
+        return result
+
+    def host_has_anchor(self, host_name, anchor_trait, rp_tree=None):
+        """Return True iff the host RP subtree contains at least one
+        sub-RP carrying ``anchor_trait``.
+
+        Anchor traits are written by the topology-aware Cyborg driver
+        onto sub-RPs that represent a physical socket
+        (CUSTOM_SOCKET_ROOT) or NUMA node (HW_NUMA_ROOT) under the
+        compute host. Their presence is a pre-flight signal that the
+        host has the requested topology kind at all -- the actual
+        same_subtree= co-location decision is Nova's at boot time.
+        """
+        if rp_tree is None:
+            rp_tree = self.get_host_rp_tree(host_name)
+        for rp_entry in rp_tree.values():
+            if self._rp_is_blazar_reservation(rp_entry):
+                continue
+            if anchor_trait in (rp_entry.get('traits') or []):
+                return True
+        return False
+
+    def host_subtree_has_traits(self, host_name, required_traits,
+                                rp_tree=None):
+        """Return True iff the union of traits across every non-Blazar
+        sub-RP in the host's tree is a superset of ``required_traits``.
+
+        Used for pre-flight trait matching at reservation time. This is
+        a coarse check -- placement still enforces per-request-group
+        traits at boot. We only need to know "is this trait present
+        somewhere in the host's tree" to reject obviously-incompatible
+        hosts.
+        """
+        if not required_traits:
+            return True
+        if rp_tree is None:
+            rp_tree = self.get_host_rp_tree(host_name)
+        union = set()
+        for rp_entry in rp_tree.values():
+            if self._rp_is_blazar_reservation(rp_entry):
+                continue
+            union.update(rp_entry.get('traits') or [])
+        return set(required_traits).issubset(union)

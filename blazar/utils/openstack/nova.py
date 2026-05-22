@@ -566,3 +566,91 @@ class NovaInventory(NovaClientWrapper):
                 #  a list of hosts without 'servers' attribute if no servers
                 #  are running on that host
                 return None
+
+
+class FlavorAccessor(NovaClientWrapper):
+    """Read-only flavor lookup used at reservation time.
+
+    Item 2 of the topology-aware reservation work fetches the flavor
+    by id, extracts vcpus/memory_mb/disk_gb and the resources:* /
+    trait:* / hw:cyborg_locality / accel:device_profile extra-specs,
+    and feeds them into the placement pre-flight.
+    """
+
+    def __init__(self):
+        super(FlavorAccessor, self).__init__(
+            username=CONF.os_admin_username,
+            password=CONF.os_admin_password,
+            user_domain_name=CONF.os_admin_user_domain_name,
+            project_name=CONF.os_admin_project_name,
+            project_domain_name=CONF.os_admin_project_domain_name)
+
+    def get_flavor(self, flavor_id):
+        """Return ({'vcpus', 'memory_mb', 'disk_gb'}, extra_specs dict).
+
+        :param flavor_id: id or name of the flavor
+        :raises FlavorNotFound: if Nova has no such flavor
+        """
+        try:
+            flavor = self.nova.flavors.get(flavor_id)
+        except nova_exception.NotFound:
+            raise manager_exceptions.FlavorNotFound(flavor=flavor_id)
+        try:
+            extra_specs = flavor.get_keys() or {}
+        except nova_exception.ClientException:
+            extra_specs = {}
+        standard = {
+            'vcpus': flavor.vcpus,
+            'memory_mb': flavor.ram,
+            'disk_gb': flavor.disk,
+        }
+        return standard, dict(extra_specs)
+
+
+def parse_flavor_constraints(extra_specs):
+    """Extract topology-aware reservation inputs from flavor extra specs.
+
+    :param extra_specs: dict from ``Flavor.get_keys()``
+    :return: dict with keys
+        ``accelerator_resources``: dict[str, int]
+        ``required_traits``: list[str]
+        ``topology_locality``: str or None
+        ``device_profile``: str or None
+    """
+    accel = {}
+    traits = []
+    locality = None
+    device_profile = None
+
+    for key, value in (extra_specs or {}).items():
+        if key.startswith('resources:'):
+            rc = key[len('resources:'):]
+            if rc in ('VCPU', 'MEMORY_MB', 'DISK_GB'):
+                # Already covered by the standard fields; skip.
+                continue
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                LOG.warning(
+                    "Ignoring non-integer flavor extra spec %s=%r",
+                    key, value)
+                continue
+            if count > 0:
+                accel[rc] = accel.get(rc, 0) + count
+        elif key.startswith('trait:'):
+            if str(value).lower() == 'required':
+                traits.append(key[len('trait:'):])
+        elif key == 'hw:cyborg_locality':
+            v = str(value).lower()
+            if v in ('socket', 'numa'):
+                locality = v
+            # 'none' / missing / anything else -> no topology constraint
+        elif key == 'accel:device_profile':
+            device_profile = value
+
+    return {
+        'accelerator_resources': accel,
+        'required_traits': traits,
+        'topology_locality': locality,
+        'device_profile': device_profile,
+    }

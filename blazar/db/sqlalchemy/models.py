@@ -209,6 +209,11 @@ class InstanceReservations(mb.BlazarBase):
     flavor_id = sa.Column(sa.String(36), nullable=True)
     aggregate_id = sa.Column(sa.Integer, nullable=True)
     server_group_id = sa.Column(sa.String(36), nullable=True)
+    # Topology-aware reservation (2026.1): JSON blob holding
+    # {accelerator_resources, required_traits, topology_locality,
+    #  flavor_id} so overlapping-window pre-flights can subtract
+    # already-committed accelerator counts on the same hosts.
+    accelerator_constraints = sa.Column(MediumText(), nullable=True)
 
 
 class ComputeHostAllocation(mb.BlazarBase):

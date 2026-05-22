@@ -31,13 +31,41 @@ from blazar.plugins import base
 from blazar.plugins import instances as plugin
 from blazar.plugins import oshosts
 from blazar import status
+from blazar.utils.openstack import cyborg
 from blazar.utils.openstack import exceptions as openstack_ex
 from blazar.utils.openstack import nova
 from blazar.utils.openstack import placement
 from blazar.utils import plugins as plugins_utils
 
+try:
+    from oslo_serialization import jsonutils
+except ImportError:  # pragma: no cover
+    import json as jsonutils
+
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
+
+# Topology-aware reservation options
+scheduler_opts = [
+    cfg.BoolOpt('accelerator_aware',
+                default=True,
+                help='If True, the virtual instance plugin will read the '
+                     'Placement RP subtree for each candidate compute host '
+                     'and reject hosts that cannot satisfy the flavor\'s '
+                     'accelerator inventory, traits, or topology anchor at '
+                     'reservation time. Set to False on deployments where '
+                     'Cyborg/Placement are not deployed for accelerators.'),
+]
+CONF.register_opts(scheduler_opts, group='scheduler')
+
+# Topology anchor traits written by the topology-aware Cyborg driver.
+# (See feature/2026.1-socket-multi-device-topology-awareness in the Cyborg
+# fork.) These names are part of the public contract between the Cyborg
+# driver and Blazar's pre-flight; do not change without coordinating.
+TOPOLOGY_ANCHOR_TRAITS = {
+    'socket': 'CUSTOM_SOCKET_ROOT',
+    'numa': 'HW_NUMA_ROOT',
+}
 
 RESERVATION_PREFIX = 'reservation'
 FLAVOR_EXTRA_SPEC = "aggregate_instance_extra_specs:" + RESERVATION_PREFIX
@@ -188,7 +216,10 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
     def query_available_hosts(self, cpus=None, memory=None, disk=None,
                               resource_properties=None,
                               start_date=None, end_date=None,
-                              excludes_res=None):
+                              excludes_res=None,
+                              accelerator_resources=None,
+                              required_traits=None,
+                              topology_locality=None):
         """Returns a list of available hosts for a reservation.
 
         The list is in the order of reserved hosts to free hosts.
@@ -200,6 +231,25 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
            allocate_host
         4. filter out hosts that can't accommodate the flavor at the
            time frame because of other reservations
+        5. (new) filter out hosts that cannot satisfy the flavor's
+           accelerator inventory, traits, or topology anchor
+
+        The three new kwargs default to None/empty and preserve the
+        original behaviour bit-for-bit when not supplied.
+
+        :param accelerator_resources: dict[str, int] of required
+            accelerator resource class -> count. The host's placement
+            RP subtree must hold at least this many of each class in
+            *effective availability* (placement total minus placement
+            usage minus any overlapping Blazar reservation's committed
+            count for the same class).
+        :param required_traits: list of trait strings the host RP
+            subtree must carry somewhere.
+        :param topology_locality: ``"socket"``, ``"numa"`` or ``None``.
+            When non-None, the host must have at least one anchor
+            sub-RP with the matching anchor trait. This is a
+            feasibility pre-flight, *not* a scheduling decision -- Nova
+            picks the actual anchor sub-RP at boot.
         """
         flavor_definitions = [
             'and',
@@ -220,12 +270,186 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             end_date + datetime.timedelta(minutes=CONF.cleaning_time),
             excludes_res)
 
+        accel_constraints = self._normalise_accel_constraints(
+            accelerator_resources, required_traits, topology_locality)
+
         available_hosts = []
         for host_info in (reserved_hosts + free_hosts):
+            host = host_info['host']
+            if accel_constraints and not self._host_satisfies_accel(
+                    host, host_info['reservations'], accel_constraints,
+                    start_date, end_date, excludes_res):
+                continue
             hosts_list = self.get_hosts_list(host_info, cpus, memory, disk)
             available_hosts.extend(hosts_list)
 
         return available_hosts
+
+    @staticmethod
+    def _normalise_accel_constraints(accelerator_resources,
+                                     required_traits,
+                                     topology_locality):
+        """Return a dict iff any constraint is set, else None."""
+        accel = dict(accelerator_resources or {})
+        traits = list(required_traits or [])
+        loc = topology_locality if topology_locality in ('socket',
+                                                          'numa') else None
+        if not accel and not traits and loc is None:
+            return None
+        return {
+            'accelerator_resources': accel,
+            'required_traits': traits,
+            'topology_locality': loc,
+        }
+
+    def _host_satisfies_accel(self, host, host_reservations, constraints,
+                              start_date, end_date, excludes_res):
+        """Apply accelerator/trait/topology constraints to one host.
+
+        :param host: row from blazar.db (has 'hypervisor_hostname')
+        :param host_reservations: list of Reservation objects in window
+        :param constraints: dict from :py:meth:`_normalise_accel_constraints`
+        :return: True iff this host can satisfy the constraints.
+        """
+        if not CONF.scheduler.accelerator_aware:
+            return True
+
+        host_name = host.get('hypervisor_hostname') or host.get('name')
+        if not host_name:
+            LOG.debug("Host row %s has no hypervisor_hostname; "
+                      "skipping accelerator pre-flight.", host.get('id'))
+            return True
+
+        try:
+            rp_tree = self.placement_client.get_host_rp_tree(host_name)
+        except Exception as exc:
+            LOG.warning(
+                "Placement RP-tree read failed for host %s: %s. "
+                "Excluding from accelerator-aware candidates.",
+                host_name, exc)
+            return False
+
+        if not rp_tree:
+            # Host has no RP at all -- can't be a candidate when
+            # accelerator constraints are in play.
+            return False
+
+        # Required traits: union of traits across non-Blazar sub-RPs
+        # must include every required trait.
+        if constraints['required_traits']:
+            if not self.placement_client.host_subtree_has_traits(
+                    host_name, constraints['required_traits'],
+                    rp_tree=rp_tree):
+                return False
+
+        # Topology anchor: at least one sub-RP carries the anchor trait.
+        loc = constraints['topology_locality']
+        if loc is not None:
+            anchor_trait = TOPOLOGY_ANCHOR_TRAITS.get(loc)
+            if anchor_trait is None:
+                return False
+            if not self.placement_client.host_has_anchor(
+                    host_name, anchor_trait, rp_tree=rp_tree):
+                return False
+
+        # Accelerator inventory: effective availability >= required.
+        accel = constraints['accelerator_resources']
+        if accel:
+            inv = self.placement_client.get_accelerator_inventory_for_host(
+                host_name, list(accel.keys()), rp_tree=rp_tree)
+            committed = self._committed_accel_for_host(
+                host['id'], host_reservations, accel.keys(),
+                start_date, end_date, excludes_res)
+            for rc, required in accel.items():
+                total = inv.get(rc, {}).get('total', 0)
+                used = inv.get(rc, {}).get('used', 0)
+                effective = total - used - committed.get(rc, 0)
+                if effective < required:
+                    LOG.debug(
+                        "Host %s rejected: %s effective=%s < required=%s "
+                        "(total=%s used=%s committed=%s)",
+                        host_name, rc, effective, required,
+                        total, used, committed.get(rc, 0))
+                    return False
+        return True
+
+    def _committed_accel_for_host(self, host_id, host_reservations,
+                                  resource_classes, start_date, end_date,
+                                  excludes_res):
+        """Sum committed accelerator counts from overlapping leases.
+
+        ``host_reservations`` is the list Blazar already fetched in
+        :py:meth:`filter_hosts_by_reservation`. We replay it here to
+        pull each instance_reservation's persisted
+        ``accelerator_constraints`` blob (the new column added by the
+        alembic migration in this branch) and add up everything that
+        belongs to the same resource class.
+        """
+        committed = {rc: 0 for rc in resource_classes}
+        excludes = set(excludes_res or [])
+        for r in host_reservations or []:
+            if r.get('id') in excludes:
+                continue
+            if r.get('resource_type') != plugin.RESOURCE_TYPE:
+                continue
+            blob = self._fetch_reservation_accel_blob(r)
+            if not blob:
+                continue
+            for rc, count in (blob.get('accelerator_resources') or {}).items():
+                if rc in committed:
+                    # ``amount`` is reservation-wide; for per-host
+                    # committed accounting, count one instance per host
+                    # the reservation occupies. We don't have a
+                    # per-host slot count cheaply here, so use the most
+                    # conservative thing: the full amount on this host.
+                    # Worst-case this *overcounts*, which is the right
+                    # direction for a pre-flight (it rejects more, not
+                    # fewer, hosts).
+                    amount = r.get('instance_reservation', {}).get(
+                        'amount', 1) or 1
+                    committed[rc] += int(count) * int(amount)
+        return committed
+
+    @staticmethod
+    def _fetch_reservation_accel_blob(reservation):
+        """Read accelerator_constraints from an in-memory Reservation.
+
+        The Reservation object may be a SQLAlchemy row or a dict-like.
+        We prefer the joined instance_reservation if available.
+        """
+        ir = None
+        if isinstance(reservation, dict):
+            ir = reservation.get('instance_reservation')
+            if ir is None:
+                # caller may have given just the reservation id
+                rid = reservation.get('id')
+                if rid:
+                    try:
+                        ir = db_api.instance_reservation_get(
+                            reservation.get('resource_id') or rid)
+                    except Exception:  # pragma: no cover
+                        ir = None
+        else:
+            ir = getattr(reservation, 'instance_reservation', None)
+            if ir is None:
+                rid = getattr(reservation, 'resource_id', None)
+                if rid:
+                    try:
+                        ir = db_api.instance_reservation_get(rid)
+                    except Exception:  # pragma: no cover
+                        ir = None
+        if ir is None:
+            return None
+        raw = ir['accelerator_constraints'] if isinstance(ir, dict) else (
+            getattr(ir, 'accelerator_constraints', None))
+        if not raw:
+            return None
+        if isinstance(raw, (dict,)):
+            return raw
+        try:
+            return jsonutils.loads(raw)
+        except (TypeError, ValueError):
+            return None
 
     def pickup_hosts(self, reservation_id, values):
         """Returns lists of host ids to add/remove.
@@ -251,6 +475,12 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             'start_date': values['start_date'],
             'end_date': values['end_date']
             }
+        # New (optional) accelerator-aware kwargs. Defaults preserve
+        # the historical behaviour.
+        for k in ('accelerator_resources', 'required_traits',
+                  'topology_locality'):
+            if k in values:
+                query_params[k] = values[k]
 
         old_allocs = db_api.host_allocation_get_all_by_values(
             reservation_id=reservation_id)
@@ -466,7 +696,85 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
                 raise mgr_exceptions.MalformedParameter(
                     param='affinity (must be a bool value or None)')
 
+    def _maybe_apply_flavor(self, values):
+        """If values['flavor_id'] is set, expand the flavor and mutate
+        values in-place to carry the standard fields plus accelerator
+        constraints.
+
+        :param values: reservation input dict (mutated in place).
+        :return: dict suitable for serialisation into
+                 ``instance_reservations.accelerator_constraints``
+                 (or None if no flavor was supplied or no constraints
+                 were extracted).
+        """
+        flavor_id = values.get('flavor_id') if values else None
+        if not flavor_id:
+            return None
+
+        # Standard fields from the flavor override any explicit
+        # vcpus/memory_mb/disk_gb the user passed alongside flavor_id.
+        # Rationale: when flavor_id is given it is the source of truth;
+        # nothing else needs to be specified.
+        try:
+            standard, extra = nova.FlavorAccessor().get_flavor(flavor_id)
+        except mgr_exceptions.FlavorNotFound:
+            raise
+        except nova_exceptions.ClientException as exc:
+            LOG.exception("Nova flavor lookup failed for %s", flavor_id)
+            raise mgr_exceptions.FlavorNotFound(flavor=flavor_id) from exc
+
+        values['vcpus'] = standard['vcpus']
+        values['memory_mb'] = standard['memory_mb']
+        values['disk_gb'] = standard['disk_gb']
+
+        parsed = nova.parse_flavor_constraints(extra)
+        accel_resources = dict(parsed['accelerator_resources'])
+        required_traits = list(parsed['required_traits'])
+        locality = parsed['topology_locality']
+
+        # Cyborg device-profile expansion (best-effort).
+        device_profile = parsed['device_profile']
+        if device_profile:
+            try:
+                client = cyborg.BlazarCyborgClient()
+                profile = client.get_device_profile(device_profile)
+                dp_accel, dp_traits = (
+                    cyborg.extract_groups_from_device_profile(profile))
+                for rc, count in dp_accel.items():
+                    accel_resources[rc] = (
+                        accel_resources.get(rc, 0) + count)
+                for trait in dp_traits:
+                    if trait not in required_traits:
+                        required_traits.append(trait)
+            except cyborg.CyborgClientError as exc:
+                LOG.warning(
+                    "Cyborg device profile %s could not be expanded "
+                    "(%s); proceeding with flavor-only constraints. "
+                    "If you need pre-flight on accelerator inventory, "
+                    "put resources:* and trait:*=required directly on "
+                    "the flavor.", device_profile, exc)
+
+        # Inject the extracted constraints so pickup_hosts forwards
+        # them to query_available_hosts.
+        values['accelerator_resources'] = accel_resources
+        values['required_traits'] = required_traits
+        values['topology_locality'] = locality
+
+        # Persist alongside the reservation so the time-window
+        # overlap math in _committed_accel_for_host can read them
+        # back later.
+        return {
+            'flavor_id': flavor_id,
+            'accelerator_resources': accel_resources,
+            'required_traits': required_traits,
+            'topology_locality': locality,
+        }
+
     def reserve_resource(self, reservation_id, values):
+        # Item 2: if the user passed flavor_id, expand it before the
+        # usual missing-param + pickup_hosts flow so accelerator
+        # constraints flow into the pre-flight.
+        accel_constraints = self._maybe_apply_flavor(values)
         self._check_missing_reservation_params(values)
         self._validate_reservation_params(values)
 
@@ -481,6 +789,9 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             'affinity': bool_from_string(values['affinity'], default=None),
             'resource_properties': values['resource_properties']
             }
+        if accel_constraints is not None:
+            instance_reservation_val['accelerator_constraints'] = (
+                jsonutils.dumps(accel_constraints))
         instance_reservation = db_api.instance_reservation_create(
             instance_reservation_val)
 

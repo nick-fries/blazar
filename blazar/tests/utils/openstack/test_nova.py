@@ -609,3 +609,163 @@ class NovaInventoryTestCase(tests.TestCase):
         del host_with_zero_servers.servers
         servers = self.inventory.get_servers_per_host('fake_name')
         self.assertEqual(None, servers)
+
+
+class TestParseFlavorConstraints(tests.TestCase):
+    """Tests for nova.parse_flavor_constraints, the helper that turns
+    Nova flavor extra-specs into Blazar's accelerator constraint
+    dict. Pure function, no I/O."""
+
+    def test_empty_extra_specs_returns_empty_constraints(self):
+        # Arrange / Act
+        result = nova.parse_flavor_constraints({})
+        # Assert
+        self.assertEqual({}, result['accelerator_resources'])
+        self.assertEqual([], result['required_traits'])
+        self.assertIsNone(result['topology_locality'])
+        self.assertIsNone(result['device_profile'])
+
+    def test_resources_prefix_extracted_to_accelerator_resources(self):
+        # Arrange
+        extra_specs = {'resources:CUSTOM_AMD_V620_VF': '1',
+                       'resources:PGPU': '2'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert
+        self.assertEqual({'CUSTOM_AMD_V620_VF': 1, 'PGPU': 2},
+                         result['accelerator_resources'])
+
+    def test_resources_vcpu_memory_disk_are_skipped(self):
+        # Standard fields are not accelerators -- they come from
+        # flavor.vcpus/ram/disk instead.
+        # Arrange
+        extra_specs = {'resources:VCPU': '4',
+                       'resources:MEMORY_MB': '8192',
+                       'resources:DISK_GB': '20',
+                       'resources:PGPU': '1'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert
+        self.assertEqual({'PGPU': 1}, result['accelerator_resources'])
+
+    def test_trait_required_extracted(self):
+        # Arrange
+        extra_specs = {'trait:CUSTOM_AMD_V620': 'required',
+                       'trait:CUSTOM_AMD_V620_NUMA0': 'required',
+                       'trait:HW_NIC_OFFLOAD_TSO': 'forbidden'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert: only required, not forbidden
+        self.assertIn('CUSTOM_AMD_V620', result['required_traits'])
+        self.assertIn('CUSTOM_AMD_V620_NUMA0', result['required_traits'])
+        self.assertNotIn('HW_NIC_OFFLOAD_TSO', result['required_traits'])
+
+    def test_topology_locality_socket(self):
+        # Arrange
+        # Act
+        result = nova.parse_flavor_constraints(
+            {'hw:cyborg_locality': 'socket'})
+        # Assert
+        self.assertEqual('socket', result['topology_locality'])
+
+    def test_topology_locality_numa(self):
+        # Arrange / Act
+        result = nova.parse_flavor_constraints(
+            {'hw:cyborg_locality': 'numa'})
+        # Assert
+        self.assertEqual('numa', result['topology_locality'])
+
+    def test_topology_locality_none_is_no_constraint(self):
+        # Arrange / Act
+        result = nova.parse_flavor_constraints(
+            {'hw:cyborg_locality': 'none'})
+        # Assert
+        self.assertIsNone(result['topology_locality'])
+
+    def test_device_profile_extracted(self):
+        # Arrange / Act
+        result = nova.parse_flavor_constraints(
+            {'accel:device_profile': 'v620-singlevf'})
+        # Assert
+        self.assertEqual('v620-singlevf', result['device_profile'])
+
+    def test_non_integer_resources_value_logged_and_skipped(self):
+        # Arrange
+        extra_specs = {'resources:PGPU': 'not-a-number',
+                       'resources:CUSTOM_FPGA': '3'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert: bad value skipped, good value kept
+        self.assertNotIn('PGPU', result['accelerator_resources'])
+        self.assertEqual(3, result['accelerator_resources']['CUSTOM_FPGA'])
+
+
+class TestFlavorAccessor(tests.TestCase):
+    """Tests for nova.FlavorAccessor.get_flavor."""
+
+    def setUp(self):
+        super(TestFlavorAccessor, self).setUp()
+        self.cfg = self.useFixture(fixture.Config(CONF))
+
+    def _accessor_with_fake_nova(self, fake_flavor=None,
+                                  raises=None):
+        accessor = nova.FlavorAccessor()
+        fake = mock.Mock()
+        if raises is not None:
+            fake.flavors.get.side_effect = raises
+        else:
+            fake.flavors.get.return_value = fake_flavor
+        # nova.NovaClientWrapper.nova is a @property; patching the
+        # instance dict doesn't shadow it. Patch the descriptor at the
+        # class level for the duration of the test.
+        p = mock.patch.object(type(accessor), 'nova',
+                              new_callable=mock.PropertyMock,
+                              return_value=fake)
+        p.start()
+        self.addCleanup(p.stop)
+        return accessor
+
+    def test_get_flavor_returns_standard_and_extra_specs(self):
+        # Arrange
+        fake_flavor = mock.Mock()
+        fake_flavor.vcpus = 4
+        fake_flavor.ram = 8192
+        fake_flavor.disk = 20
+        fake_flavor.get_keys.return_value = {
+            'resources:PGPU': '1',
+            'trait:CUSTOM_AMD_V620': 'required',
+        }
+        accessor = self._accessor_with_fake_nova(fake_flavor=fake_flavor)
+        # Act
+        standard, extra = accessor.get_flavor('flavor-1')
+        # Assert
+        self.assertEqual({'vcpus': 4, 'memory_mb': 8192,
+                          'disk_gb': 20}, standard)
+        self.assertEqual('1', extra['resources:PGPU'])
+        self.assertEqual('required', extra['trait:CUSTOM_AMD_V620'])
+
+    def test_get_flavor_not_found_raises(self):
+        # Arrange
+        accessor = self._accessor_with_fake_nova(
+            raises=nova_exceptions.NotFound(404))
+        # Act / Assert
+        self.assertRaises(manager_exceptions.FlavorNotFound,
+                          accessor.get_flavor, 'nope')
+
+    def test_get_flavor_extra_specs_error_returns_empty(self):
+        # If get_keys() blows up (e.g. no permission to read extras),
+        # we degrade gracefully to standard fields only -- a reserve
+        # without any accelerator extras still works.
+        # Arrange
+        fake_flavor = mock.Mock()
+        fake_flavor.vcpus = 2
+        fake_flavor.ram = 1024
+        fake_flavor.disk = 5
+        fake_flavor.get_keys.side_effect = (
+            nova_exceptions.ClientException(500))
+        accessor = self._accessor_with_fake_nova(fake_flavor=fake_flavor)
+        # Act
+        standard, extra = accessor.get_flavor('flavor-2')
+        # Assert
+        self.assertEqual(2, standard['vcpus'])
+        self.assertEqual({}, extra)

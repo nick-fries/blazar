@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import datetime
+import json
 from unittest import mock
 import uuid
 
@@ -1733,3 +1734,564 @@ class TestVirtualInstancePlugin(tests.TestCase):
                 'group-1')
         mock_nova.nova.flavors.delete.assert_called_once_with(
             'reservation-id1')
+
+
+class FakePlacementClient(object):
+    """In-memory stand-in for BlazarPlacementClient.
+
+    Each test arranges hosts as dicts mapping hostname -> {
+        'subtree_traits': set of trait strings present somewhere in tree,
+        'anchors': set of anchor trait strings present in tree,
+        'inventory': dict resource_class -> {'total', 'used'},
+        'tree_present': True iff host_rp exists,
+    }.
+    """
+
+    def __init__(self, hosts):
+        self._hosts = hosts
+        self.calls = []
+
+    def get_host_rp_tree(self, host_name):
+        self.calls.append(('tree', host_name))
+        if not self._hosts.get(host_name, {}).get('tree_present', True):
+            return {}
+        return {'root': {'name': host_name, 'traits': [], 'inventory': {}}}
+
+    def get_accelerator_inventory_for_host(self, host_name,
+                                            resource_classes,
+                                            rp_tree=None):
+        inv = self._hosts.get(host_name, {}).get('inventory', {})
+        result = {}
+        for rc in resource_classes:
+            result[rc] = inv.get(rc, {'total': 0, 'used': 0})
+        return result
+
+    def host_has_anchor(self, host_name, anchor_trait, rp_tree=None):
+        return anchor_trait in self._hosts.get(
+            host_name, {}).get('anchors', set())
+
+    def host_subtree_has_traits(self, host_name, required_traits,
+                                rp_tree=None):
+        if not required_traits:
+            return True
+        return set(required_traits).issubset(
+            self._hosts.get(host_name, {}).get('subtree_traits', set()))
+
+
+class TestTopologyAwareQuery(tests.TestCase):
+    """Tests for query_available_hosts with accelerator_resources,
+    required_traits, and topology_locality kwargs."""
+
+    def setUp(self):
+        super(TestTopologyAwareQuery, self).setUp()
+
+    def _build_plugin(self, hosts, placement_state):
+        """Wire up a VirtualInstancePlugin with mocked DB and a fake
+        placement client.
+
+        :param hosts: list of host-row dicts to be returned by
+            reservable_host_get_all_by_queries.
+        :param placement_state: dict host_name -> per-host placement
+            state for FakePlacementClient.
+        """
+        mock_host_get_query = self.patch(
+            db_api, 'reservable_host_get_all_by_queries')
+        mock_host_get_query.return_value = hosts
+        self.patch(db_utils, 'get_reservations_by_host_id').return_value = []
+
+        plugin = instance_plugin.VirtualInstancePlugin()
+        plugin.placement_client = FakePlacementClient(placement_state)
+        return plugin
+
+    def _h(self, host_id, name='compute-01'):
+        # Default host row Blazar's DB returns.
+        return {'id': host_id, 'hypervisor_hostname': name,
+                'vcpus': 16, 'memory_mb': 65536, 'local_gb': 1000}
+
+    def _query(self, plugin, **overrides):
+        kwargs = {
+            'cpus': 4,
+            'memory': 8192,
+            'disk': 20,
+            'resource_properties': '',
+            'start_date': datetime.datetime(2030, 1, 1, 8, 0),
+            'end_date': datetime.datetime(2030, 1, 1, 12, 0),
+        }
+        kwargs.update(overrides)
+        return plugin.query_available_hosts(**kwargs)
+
+    # ---- defaults preserve old behavior --------------------------------
+
+    def test_no_accelerator_kwargs_preserves_old_behavior(self):
+        # Arrange: zero accelerator inventory but no accelerator constraint.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {}, 'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act
+        ret = self._query(plugin)
+        # Assert: host fits cpu/mem/disk; returned multiple times because
+        # the bin-pack allows multiple instances.
+        self.assertIn(host, ret)
+        # And no placement calls happened.
+        self.assertEqual([], plugin.placement_client.calls)
+
+    # ---- accelerator inventory ----------------------------------------
+
+    def test_positive_host_with_enough_pgpu_accepted(self):
+        # Arrange
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        # Assert
+        self.assertIn(host, ret)
+
+    def test_filter_rejects_host_with_zero_pgpu(self):
+        # Arrange
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 0, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        # Assert
+        self.assertEqual([], ret)
+
+    def test_boundary_exact_match_pgpu_accepted(self):
+        # Arrange: host has exactly 1 PGPU, reservation needs exactly 1.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 1, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        # Assert
+        self.assertIn(host, ret)
+
+    def test_over_allocation_rejected(self):
+        # Arrange: host has 2 PGPU, reservation asks 3.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 3})
+        # Assert
+        self.assertEqual([], ret)
+
+    def test_used_inventory_subtracted_from_effective(self):
+        # Arrange: host has total=2 used=1 (Nova has allocated 1).
+        # Reservation for 2 must fail.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 1}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 2})
+        # Assert
+        self.assertEqual([], ret)
+
+    def test_trait_mismatch_rejects(self):
+        # Arrange: host has PGPU but no CUSTOM_AMD_V620_VF trait.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {
+                'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                'anchors': set(),
+                'subtree_traits': {'PGPU_FLAG'},
+            }})
+        # Act
+        ret = self._query(plugin,
+                          accelerator_resources={'PGPU': 1},
+                          required_traits=['CUSTOM_AMD_V620_VF'])
+        # Assert
+        self.assertEqual([], ret)
+
+    def test_required_traits_present_accepted(self):
+        # Arrange
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {
+                'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                'anchors': set(),
+                'subtree_traits': {'CUSTOM_AMD_V620_VF',
+                                    'CUSTOM_AMD_V620'},
+            }})
+        # Act
+        ret = self._query(plugin,
+                          accelerator_resources={'PGPU': 1},
+                          required_traits=['CUSTOM_AMD_V620_VF'])
+        # Assert
+        self.assertIn(host, ret)
+
+    def test_topology_anchor_missing_rejects(self):
+        # Arrange: locality=socket required but no CUSTOM_SOCKET_ROOT.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {
+                'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                'anchors': set(),
+                'subtree_traits': set(),
+            }})
+        # Act
+        ret = self._query(plugin,
+                          accelerator_resources={'PGPU': 1},
+                          topology_locality='socket')
+        # Assert
+        self.assertEqual([], ret)
+
+    def test_topology_anchor_present_accepted(self):
+        # Arrange
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {
+                'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                'anchors': {'CUSTOM_SOCKET_ROOT'},
+                'subtree_traits': set(),
+            }})
+        # Act
+        ret = self._query(plugin,
+                          accelerator_resources={'PGPU': 1},
+                          topology_locality='socket')
+        # Assert
+        self.assertIn(host, ret)
+
+    def test_topology_numa_anchor_uses_hw_numa_root(self):
+        # Arrange: locality=numa expects HW_NUMA_ROOT, not socket.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {
+                'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                'anchors': {'CUSTOM_SOCKET_ROOT'},  # socket only
+                'subtree_traits': set(),
+            }})
+        # Act
+        ret = self._query(plugin,
+                          accelerator_resources={'PGPU': 1},
+                          topology_locality='numa')
+        # Assert: needs HW_NUMA_ROOT, not present -> rejected
+        self.assertEqual([], ret)
+
+    def test_missing_input_preserves_baseline(self):
+        # Arrange: explicit None inputs must behave like absent.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {}, 'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act
+        ret = self._query(plugin,
+                          accelerator_resources=None,
+                          required_traits=None,
+                          topology_locality=None)
+        # Assert
+        self.assertIn(host, ret)
+
+    def test_already_reserved_host_pgpu_count_subtracted(self):
+        # Arrange: host has 2 PGPU total, no placement usage, but another
+        # Blazar reservation in the window already committed 1 PGPU.
+        # Effective availability is 1; reservation for 2 must fail.
+        host = self._h('h1', 'compute-01')
+        other_reservation = {
+            'id': 'r-other', 'lease_id': 'l-other',
+            'resource_type': instances.RESOURCE_TYPE,
+            'resource_id': 'ir-other',
+            'instance_reservation': {
+                'amount': 1,
+                'accelerator_constraints': '{"accelerator_resources": '
+                                           '{"PGPU": 1}, '
+                                           '"required_traits": [], '
+                                           '"topology_locality": null}',
+            },
+        }
+        self.patch(db_api, 'reservable_host_get_all_by_queries').return_value\
+            = [host]
+
+        def fake_resv_by_host(host_id, start, end):
+            return [other_reservation]
+
+        self.patch(db_utils, 'get_reservations_by_host_id').side_effect = (
+            fake_resv_by_host)
+
+        plugin = instance_plugin.VirtualInstancePlugin()
+        plugin.placement_client = FakePlacementClient({
+            'compute-01': {
+                'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                'anchors': set(),
+                'subtree_traits': set(),
+            }})
+
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 2})
+
+        # Assert
+        self.assertEqual([], ret)
+
+    def test_already_reserved_excluded_by_excludes_res(self):
+        # Arrange: an overlapping reservation exists, but its id is in
+        # excludes_res (which is what update-reservation does). Its
+        # PGPU commit should not subtract.
+        host = self._h('h1', 'compute-01')
+        other_reservation = {
+            'id': 'r-other', 'lease_id': 'l-other',
+            'resource_type': instances.RESOURCE_TYPE,
+            'resource_id': 'ir-other',
+            'instance_reservation': {
+                'amount': 1,
+                'accelerator_constraints': '{"accelerator_resources": '
+                                           '{"PGPU": 1}, '
+                                           '"required_traits": [], '
+                                           '"topology_locality": null}',
+            },
+        }
+        self.patch(db_api, 'reservable_host_get_all_by_queries').return_value\
+            = [host]
+        self.patch(db_utils, 'get_reservations_by_host_id').return_value = (
+            [other_reservation])
+
+        plugin = instance_plugin.VirtualInstancePlugin()
+        plugin.placement_client = FakePlacementClient({
+            'compute-01': {
+                'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                'anchors': set(),
+                'subtree_traits': set(),
+            }})
+
+        # Act: ask for the full 2 PGPU but exclude the other reservation.
+        ret = self._query(plugin,
+                          accelerator_resources={'PGPU': 2},
+                          excludes_res=['r-other'])
+        # Assert
+        self.assertIn(host, ret)
+
+    def test_accelerator_aware_disabled_passes_through(self):
+        # Arrange: turn off the feature entirely via config.
+        from oslo_config import cfg as oslo_cfg  # noqa: re-import for clarity
+        from oslo_config import fixture as conf_fixture
+        self.cfg = self.useFixture(conf_fixture.Config(oslo_cfg.CONF))
+        self.cfg.config(group='scheduler', accelerator_aware=False)
+
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 0, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        # Act: even with PGPU=1 required, feature-disabled means we just
+        # use the original cpu/mem/disk filter.
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        # Assert
+        self.assertIn(host, ret)
+
+
+class TestReserveResourceWithFlavor(tests.TestCase):
+    """Tests for the flavor_id-based code path in reserve_resource."""
+
+    def setUp(self):
+        super(TestReserveResourceWithFlavor, self).setUp()
+
+    def _patch_db(self):
+        self.mock_inst_create = self.patch(db_api,
+                                            'instance_reservation_create')
+        self.mock_inst_create.return_value = {
+            'id': 'instance-reservation-id1'}
+        self.patch(db_api, 'host_allocation_create')
+        self.patch(db_api, 'instance_reservation_update')
+
+    def _patch_create_resources(self, plugin):
+        m = self.patch(plugin, '_create_resources')
+        m.return_value = (mock.MagicMock(id=1),
+                          mock.MagicMock(id=2),
+                          mock.MagicMock(id=3))
+
+    def _patch_flavor(self, standard, extras):
+        fa = self.patch(nova, 'FlavorAccessor')
+        fa.return_value.get_flavor.return_value = (standard, extras)
+        return fa
+
+    def _values(self, **overrides):
+        v = {
+            'amount': 1,
+            'affinity': 'False',
+            'resource_properties': '',
+            'start_date': datetime.datetime(2030, 1, 1, 8, 0),
+            'end_date': datetime.datetime(2030, 1, 1, 12, 0),
+            'lease_id': 'lease-1',
+        }
+        v.update(overrides)
+        return v
+
+    def test_flavor_id_no_extras_behaves_like_explicit_fields(self):
+        # Arrange
+        plugin = instance_plugin.VirtualInstancePlugin()
+        mock_pickup = self.patch(plugin, 'pickup_hosts')
+        mock_pickup.return_value = {'added': ['h1'], 'removed': []}
+        self._patch_db()
+        self._patch_create_resources(plugin)
+        self._patch_flavor({'vcpus': 4, 'memory_mb': 8192,
+                            'disk_gb': 20}, {})
+
+        # Act
+        ret = plugin.reserve_resource(
+            'res-1', self._values(flavor_id='flavor-1'))
+
+        # Assert: vcpus/memory_mb/disk_gb were filled in from the flavor.
+        self.assertEqual('instance-reservation-id1', ret)
+        # The DB row carries a constraint blob whose accelerator
+        # fields are empty (flavor had no extras) but whose flavor_id
+        # is set so operators can trace which flavor produced the
+        # reservation. Pickup behaviour must be identical to passing
+        # explicit cpu/mem/disk.
+        recorded = self.mock_inst_create.call_args[0][0]
+        self.assertEqual(4, recorded['vcpus'])
+        self.assertEqual(8192, recorded['memory_mb'])
+        self.assertEqual(20, recorded['disk_gb'])
+        blob = json.loads(recorded['accelerator_constraints'])
+        self.assertEqual({}, blob['accelerator_resources'])
+        self.assertEqual([], blob['required_traits'])
+        self.assertIsNone(blob['topology_locality'])
+        self.assertEqual('flavor-1', blob['flavor_id'])
+        # And pickup_hosts received empty (None-equivalent) accel
+        # constraints, so query_available_hosts keeps original behaviour.
+        pickup_values = mock_pickup.call_args[0][1]
+        self.assertEqual({}, pickup_values['accelerator_resources'])
+        self.assertEqual([], pickup_values['required_traits'])
+        self.assertIsNone(pickup_values['topology_locality'])
+
+    def test_flavor_id_with_resources_pgpu_extracted_to_constraints(self):
+        # Arrange
+        plugin = instance_plugin.VirtualInstancePlugin()
+        mock_pickup = self.patch(plugin, 'pickup_hosts')
+        mock_pickup.return_value = {'added': ['h1'], 'removed': []}
+        self._patch_db()
+        self._patch_create_resources(plugin)
+        self._patch_flavor({'vcpus': 4, 'memory_mb': 8192,
+                            'disk_gb': 20},
+                           {'resources:PGPU': '1',
+                            'trait:CUSTOM_AMD_V620': 'required'})
+
+        # Act
+        plugin.reserve_resource('res-1', self._values(flavor_id='flavor-1'))
+
+        # Assert: accelerator_constraints persisted, pickup_hosts saw the
+        # accelerator_resources value.
+        recorded = self.mock_inst_create.call_args[0][0]
+        self.assertIn('accelerator_constraints', recorded)
+        blob = json.loads(recorded['accelerator_constraints'])
+        self.assertEqual({'PGPU': 1}, blob['accelerator_resources'])
+        self.assertEqual(['CUSTOM_AMD_V620'], blob['required_traits'])
+
+        pickup_values = mock_pickup.call_args[0][1]
+        self.assertEqual({'PGPU': 1},
+                          pickup_values['accelerator_resources'])
+        self.assertEqual(['CUSTOM_AMD_V620'],
+                          pickup_values['required_traits'])
+
+    def test_flavor_id_device_profile_expansion_merges_constraints(self):
+        # Arrange
+        plugin = instance_plugin.VirtualInstancePlugin()
+        mock_pickup = self.patch(plugin, 'pickup_hosts')
+        mock_pickup.return_value = {'added': ['h1'], 'removed': []}
+        self._patch_db()
+        self._patch_create_resources(plugin)
+        # Flavor has BOTH a direct trait and a device profile name.
+        self._patch_flavor({'vcpus': 4, 'memory_mb': 8192,
+                            'disk_gb': 20},
+                           {'trait:CUSTOM_FLAVOR_DIRECT': 'required',
+                            'accel:device_profile': 'v620-singlevf'})
+        # Fake Cyborg returns a profile with one group having a PGPU
+        # and a CUSTOM_FROM_PROFILE trait.
+        from blazar.utils.openstack import cyborg as cyborg_mod
+        fake = self.patch(cyborg_mod, 'BlazarCyborgClient')
+        fake.return_value.get_device_profile.return_value = {
+            'name': 'v620-singlevf',
+            'groups': [{
+                'resources:CUSTOM_AMD_V620_VF': '1',
+                'trait:CUSTOM_FROM_PROFILE': 'required',
+            }],
+        }
+
+        # Act
+        plugin.reserve_resource('res-1', self._values(flavor_id='flavor-1'))
+
+        # Assert: both flavor and device-profile constraints merged.
+        recorded = self.mock_inst_create.call_args[0][0]
+        blob = json.loads(recorded['accelerator_constraints'])
+        self.assertEqual({'CUSTOM_AMD_V620_VF': 1},
+                          blob['accelerator_resources'])
+        self.assertIn('CUSTOM_FLAVOR_DIRECT', blob['required_traits'])
+        self.assertIn('CUSTOM_FROM_PROFILE', blob['required_traits'])
+
+    def test_flavor_id_bad_flavor_raises_flavor_not_found(self):
+        # Arrange
+        plugin = instance_plugin.VirtualInstancePlugin()
+        fa = self.patch(nova, 'FlavorAccessor')
+        fa.return_value.get_flavor.side_effect = (
+            mgr_exceptions.FlavorNotFound(flavor='nope'))
+        # Act / Assert
+        self.assertRaises(
+            mgr_exceptions.FlavorNotFound,
+            plugin.reserve_resource, 'res-1',
+            self._values(flavor_id='nope'))
+
+    def test_cyborg_down_warns_and_proceeds_with_flavor_only(self):
+        # Arrange
+        plugin = instance_plugin.VirtualInstancePlugin()
+        mock_pickup = self.patch(plugin, 'pickup_hosts')
+        mock_pickup.return_value = {'added': ['h1'], 'removed': []}
+        self._patch_db()
+        self._patch_create_resources(plugin)
+        self._patch_flavor({'vcpus': 4, 'memory_mb': 8192,
+                            'disk_gb': 20},
+                           {'resources:CUSTOM_OWN_RC': '1',
+                            'accel:device_profile': 'will-fail'})
+        from blazar.utils.openstack import cyborg as cyborg_mod
+        fake = self.patch(cyborg_mod, 'BlazarCyborgClient')
+        fake.return_value.get_device_profile.side_effect = (
+            cyborg_mod.CyborgClientError("not deployed"))
+
+        # Act: must not raise.
+        plugin.reserve_resource('res-1', self._values(flavor_id='flavor-1'))
+
+        # Assert: the flavor-direct resources:* still landed.
+        recorded = self.mock_inst_create.call_args[0][0]
+        blob = json.loads(recorded['accelerator_constraints'])
+        self.assertEqual({'CUSTOM_OWN_RC': 1},
+                          blob['accelerator_resources'])
+
+    def test_no_flavor_id_path_does_not_touch_nova(self):
+        # Arrange
+        plugin = instance_plugin.VirtualInstancePlugin()
+        mock_pickup = self.patch(plugin, 'pickup_hosts')
+        mock_pickup.return_value = {'added': ['h1'], 'removed': []}
+        self._patch_db()
+        self._patch_create_resources(plugin)
+        fa = self.patch(nova, 'FlavorAccessor')
+
+        values = self._values(vcpus=2, memory_mb=2048, disk_gb=10)
+        # Act
+        plugin.reserve_resource('res-1', values)
+
+        # Assert: no FlavorAccessor instantiation, no accelerator blob.
+        self.assertFalse(fa.called)
+        recorded = self.mock_inst_create.call_args[0][0]
+        self.assertNotIn('accelerator_constraints', recorded)

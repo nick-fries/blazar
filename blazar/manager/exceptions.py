@@ -70,6 +70,10 @@ class HostNotFound(exceptions.NotFound):
     msg_fmt = _("Host '%(host)s' not found!")
 
 
+class FlavorNotFound(exceptions.NotFound):
+    msg_fmt = _("Flavor '%(flavor)s' not found in Nova!")
+
+
 class InvalidHost(exceptions.NotAuthorized):
     msg_fmt = _("Invalid values for host %(host)s")
 
