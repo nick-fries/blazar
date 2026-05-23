@@ -24,6 +24,7 @@ from oslo_utils.excutils import save_and_reraise_exception
 from oslo_utils import timeutils
 from stevedore import enabled
 
+from blazar.conf import reservation_reconciler as _reconciler_opts  # noqa: F401, E501
 from blazar import context
 from blazar.db import api as db_api
 from blazar.db import exceptions as db_ex
@@ -31,6 +32,7 @@ from blazar import enforcement
 from blazar import exceptions as common_ex
 from blazar import manager
 from blazar.manager import exceptions
+from blazar.manager import reservation_reconciler as _rsv_reconciler
 from blazar import monitor
 from blazar.notification import api as notification_api
 from blazar import status
@@ -62,6 +64,8 @@ LOG = logging.getLogger(__name__)
 LEASE_DATE_FORMAT = "%Y-%m-%d %H:%M"
 
 EVENT_INTERVAL = 10
+# Default has a floor of 60s via the opt's min=, but use the
+# configured value at run time.
 
 
 class ManagerService(service_utils.RPCServer):
@@ -78,6 +82,12 @@ class ManagerService(service_utils.RPCServer):
         self.resource_actions = self._setup_actions()
         self.monitors = monitor.load_monitors(self.plugins)
         self.enforcement = enforcement.UsageEnforcement()
+        # The reconciler is instantiated lazily on first
+        # cycle so that the unit-test importer doesn't pull
+        # in placement-client auth state. self.tg is provided
+        # by the parent RPCServer; we add the periodic timer
+        # in start() below.
+        self._reservation_reconciler = None
 
     def start(self):
         super(ManagerService, self).start()
@@ -86,6 +96,12 @@ class ManagerService(service_utils.RPCServer):
         # TODO(jakecoll): Find a way to test this.
         self.tg.add_timer_args(EVENT_INTERVAL, self._process_events,
                                stop_on_exception=False)
+        if CONF.reservation_reconciler.enabled:
+            interval = (CONF.reservation_reconciler
+                        .cycle_interval_seconds)
+            self.tg.add_timer_args(
+                interval, self._reservation_reconciler_thread,
+                stop_on_exception=False)
         for m in self.monitors:
             m.start_monitoring()
 
@@ -918,3 +934,28 @@ class ManagerService(service_utils.RPCServer):
         if fn is not None:
             return fn
         raise AttributeError(name)
+
+    def _reservation_reconciler_thread(self):
+        """Periodic worker: sweep for orphan reservation classes.
+
+        Wrapped in try/except so that a single bad cycle (Placement
+        outage, DB hiccup) does not kill the worker thread. The
+        reconciler instance is reused across cycles to preserve
+        per-class grace-period state.
+        """
+        if not CONF.reservation_reconciler.enabled:
+            return
+        try:
+            if self._reservation_reconciler is None:
+                # Local import keeps the placement client out of the
+                # import graph for unit tests that just want
+                # ManagerService.
+                from blazar.utils.openstack import placement
+                self._reservation_reconciler = (
+                    _rsv_reconciler.ReservationReconciler(
+                        placement_client=placement.BlazarPlacementClient()))
+            self._reservation_reconciler.reconcile(triggered_by='periodic')
+        except Exception:
+            LOG.exception(
+                "ReservationReconciler: periodic cycle raised; "
+                "continuing")

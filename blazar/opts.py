@@ -16,6 +16,7 @@ import itertools
 import blazar.api.v2.app
 import blazar.api.v2.controllers
 import blazar.cmd.api
+import blazar.conf.reservation_reconciler
 import blazar.config
 import blazar.db.base
 import blazar.db.migration.cli
@@ -41,6 +42,8 @@ def list_opts():
              blazar.db.migration.cli.command_opts,
              blazar.utils.openstack.keystone.opts,
              blazar.utils.openstack.keystone.keystone_opts)),
+        ('reservation_reconciler',
+         blazar.conf.reservation_reconciler.opts),
         ('api', blazar.api.v2.controllers.api_opts),
         ('manager', itertools.chain(blazar.manager.opts,
                                     blazar.manager.service.manager_opts)),

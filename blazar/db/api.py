@@ -555,3 +555,24 @@ def resource_property_update(resource_type, property_name, values):
 
 def resource_property_create(values):
     return IMPL.resource_property_create(values)
+
+
+# Reservation cleanup log (orphan-reservation reconciler audit trail)
+
+def reservation_cleanup_log_create(values):
+    """Persist one reconciler audit-log row."""
+    return IMPL.reservation_cleanup_log_create(values)
+
+
+def reservation_cleanup_log_list(filters=None, limit=None):
+    """List reservation cleanup-log rows, newest first.
+
+    Optional ``filters`` keys: triggered_by, action, reservation_id,
+    resource_class_name, created_at__gte.
+    """
+    return IMPL.reservation_cleanup_log_list(filters=filters, limit=limit)
+
+
+def reservation_get_all_active_uuids():
+    """Return reservation UUIDs whose status is not deleted/completed."""
+    return IMPL.reservation_get_all_active_uuids()

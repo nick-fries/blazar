@@ -381,3 +381,29 @@ class FloatingIP(mb.BlazarBase):
                            server_default=sa.true())
 
     __table_args__ = (sa.UniqueConstraint('subnet_id', 'floating_ip_address'),)
+
+
+class ReservationCleanupLog(mb.BlazarBase):
+    """Audit log of orphan-reservation reconciler activity.
+
+    A row is written every time the reconciler observes, skips, or
+    deletes a CUSTOM_RESERVATION_<uuid> resource class. The table is
+    append-only -- no UPDATE or DELETE paths exist in normal operation.
+    """
+    __tablename__ = 'reservation_cleanup_logs'
+
+    id = _id_column()
+    # The reservation UUID extracted from the resource class name. May
+    # be NULL if the class name is malformed -- we still log the
+    # forensic row, we just can't link it back to a reservation row.
+    reservation_id = sa.Column(sa.String(36), nullable=True)
+    resource_class_name = sa.Column(sa.String(255), nullable=False)
+    # detected | class_deleted | skipped_allocations | skipped_grace
+    # | error
+    action = sa.Column(sa.String(32), nullable=False)
+    # periodic | cli
+    triggered_by = sa.Column(sa.String(16), nullable=False)
+    # Free-form JSON payload: hosts touched, allocation count, error
+    # message, etc. See blazar.manager.reservation_reconciler for the
+    # exact shape per action.
+    details = sa.Column(MediumText(), nullable=True)

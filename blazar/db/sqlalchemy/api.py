@@ -1245,3 +1245,76 @@ def resource_property_get_or_create(resource_type, property_name):
     with facade_wrapper.session_for_write() as session:
         return _resource_property_get_or_create(
             session, resource_type, property_name)
+
+
+# ------------------------------------------------------------------
+# ReservationCleanupLog (audit table for the orphan-reservation
+# reconciler). All entries are written; no update/delete path exists.
+# ------------------------------------------------------------------
+
+def reservation_cleanup_log_create(values):
+    """Persist a reservation_cleanup_logs row.
+
+    :param values: dict of column values. ``resource_class_name``,
+                   ``action`` and ``triggered_by`` are required.
+    :return: dict view of the persisted row.
+    """
+    values = values.copy()
+    entry = models.ReservationCleanupLog()
+    entry.update(values)
+    with facade_wrapper.session_for_write() as session:
+        try:
+            entry.save(session=session)
+        except common_db_exc.DBDuplicateEntry as e:
+            raise db_exc.BlazarDBDuplicateEntry(
+                model=entry.__class__.__name__, columns=e.columns)
+    return entry.to_dict()
+
+
+def reservation_cleanup_log_list(filters=None, limit=None):
+    """Return reservation_cleanup_logs rows, newest first.
+
+    :param filters: optional dict supporting keys:
+                    ``triggered_by``, ``action``, ``reservation_id``,
+                    ``resource_class_name``,
+                    ``created_at__gte`` (datetime).
+    :param limit: optional max row count.
+    :return: list[dict]
+    """
+    filters = filters or {}
+    with facade_wrapper.session_for_read() as session:
+        query = session.query(models.ReservationCleanupLog)
+        for key in ('triggered_by', 'action', 'reservation_id',
+                    'resource_class_name'):
+            if key in filters and filters[key] is not None:
+                query = query.filter(
+                    getattr(models.ReservationCleanupLog, key) ==
+                    filters[key])
+        if filters.get('created_at__gte') is not None:
+            query = query.filter(
+                models.ReservationCleanupLog.created_at >=
+                filters['created_at__gte'])
+        query = query.order_by(
+            models.ReservationCleanupLog.created_at.desc(),
+            models.ReservationCleanupLog.id.desc())
+        if limit is not None:
+            query = query.limit(limit)
+        return [row.to_dict() for row in query.all()]
+
+
+def reservation_get_all_active_uuids():
+    """Return reservation UUIDs that Blazar still considers alive.
+
+    A reservation is "alive" if its ``status`` is not in
+    ('deleted', 'completed'). This matches what the orphan
+    reconciler needs: any reservation Blazar has cleanly destroyed is
+    fair game for its CUSTOM_RESERVATION_<uuid> resource class to be
+    deleted too.
+
+    :return: list[str] of reservation IDs (uuid strings).
+    """
+    excluded = ('deleted', 'completed')
+    with facade_wrapper.session_for_read() as session:
+        query = session.query(models.Reservation.id).filter(
+            models.Reservation.status.notin_(excluded))
+        return [row[0] for row in query.all()]

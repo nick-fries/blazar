@@ -70,3 +70,7 @@ class FloatingIPSubnetNotFound(exceptions.NotFound):
 class NeutronUsesFloatingIP(exceptions.InvalidInput):
     msg_fmt = _("The floating IP %(floatingip)s is used in allocation_pools "
                 "or gateway_ip in subnet %(subnet)s .")
+
+
+class ResourceClassListFailed(exceptions.BlazarException):
+    msg_fmt = _("Failed to list resource classes from placement")

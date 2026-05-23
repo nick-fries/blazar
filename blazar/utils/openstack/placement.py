@@ -634,3 +634,126 @@ class BlazarPlacementClient(object):
                 continue
             union.update(rp_entry.get('traits') or [])
         return set(required_traits).issubset(union)
+
+    # ------------------------------------------------------------------
+    # Orphan-reservation reconciler support
+    #
+    # These helpers are read-mostly and exist to let the reservation
+    # reconciler (blazar.manager.reservation_reconciler) discover
+    # CUSTOM_RESERVATION_<uuid> resource classes that no longer
+    # correspond to a live Blazar reservation. They support pagination
+    # on /resource_classes (some deployments accumulate many classes
+    # after a partial cleanup) and they NEVER write Placement state.
+    # ------------------------------------------------------------------
+
+    def list_resource_classes(self, prefix=None,
+                              microversion=PLACEMENT_MICROVERSION):
+        """List resource class names in Placement.
+
+        Pages through Placement's /resource_classes endpoint using the
+        ``links`` collection if present. Returns a list[str] of class
+        names. If ``prefix`` is given, restricts the result to classes
+        whose name starts with ``prefix``.
+
+        :param prefix: optional string prefix filter (e.g.
+                       'CUSTOM_RESERVATION_')
+        :return: list of resource class name strings
+        :raise: ResourceClassListFailed on non-2xx response.
+        """
+        next_url = '/resource_classes'
+        out = []
+        # Bound the pagination loop. 10k classes is well past anything
+        # a real deployment will have; if we ever hit it, that itself
+        # is a bug worth surfacing rather than spinning forever.
+        for _ in range(1000):
+            resp = self.get(next_url, microversion=microversion)
+            if not resp:
+                msg = ("Failed to list resource classes. "
+                       "Got %(status_code)d: %(err_text)s.")
+                args = {
+                    'status_code': resp.status_code,
+                    'err_text': resp.text,
+                }
+                LOG.error(msg, args)
+                raise exceptions.ResourceClassListFailed()
+            body = resp.json() or {}
+            for rc in body.get('resource_classes', []) or []:
+                name = rc.get('name')
+                if name is None:
+                    continue
+                if prefix is None or name.startswith(prefix):
+                    out.append(name)
+            # Placement returns a 'links' list at the top level only
+            # when the collection paginates; absence of a 'next' rel
+            # means we are done.
+            next_link = None
+            for link in (body.get('links') or []):
+                if link.get('rel') == 'next':
+                    next_link = link.get('href')
+                    break
+            if not next_link:
+                break
+            next_url = next_link
+        return out
+
+    def get_allocations_for_class(self, rc_name,
+                                  microversion=PLACEMENT_MICROVERSION):
+        """Return live allocations referencing the given resource class.
+
+        Calls GET /allocations?resource_class=<rc_name>. Returns a list
+        of consumer entries shaped like
+        ``[{"consumer_uuid": "...", "allocations": {...}}, ...]``.
+        An empty list means no consumer holds the class (safe to
+        delete). A non-2xx response raises so the caller can skip the
+        cycle rather than silently deleting an in-use class.
+
+        :param rc_name: resource class name (e.g.
+                        ``CUSTOM_RESERVATION_<UUID>``)
+        :return: list[dict]
+        :raise: ResourceClassListFailed on non-2xx response.
+        """
+        resp = self.get(
+            '/allocations?resource_class=%s' % rc_name,
+            microversion=microversion)
+        if not resp:
+            msg = ("Failed to list allocations for resource class "
+                   "%(rc)s. Got %(status_code)d: %(err_text)s.")
+            args = {
+                'rc': rc_name,
+                'status_code': resp.status_code,
+                'err_text': resp.text,
+            }
+            LOG.error(msg, args)
+            raise exceptions.ResourceClassListFailed()
+        body = resp.json() or {}
+        # Placement returns either a flat list or a dict keyed by
+        # consumer uuid depending on microversion / variant. Normalise
+        # both shapes to a list of consumer records so callers don't
+        # need to special-case it.
+        raw = body.get('allocations', body)
+        if isinstance(raw, dict):
+            return [{'consumer_uuid': cuid, 'allocations': alloc}
+                    for cuid, alloc in raw.items()]
+        if isinstance(raw, list):
+            return list(raw)
+        return []
+
+    def list_resource_providers_with_inventory(
+            self, rc_name, microversion=PLACEMENT_MICROVERSION):
+        """Return RPs that carry inventory of the given resource class.
+
+        Calls GET /resource_providers?resource=<rc>:1. Used by the
+        reconciler to find every host RP whose inventory still
+        references an orphan CUSTOM_RESERVATION_<uuid> class so each
+        can be cleared before the class itself is dropped.
+
+        :param rc_name: resource class name
+        :return: list of dicts: [{'uuid': str, 'name': str}, ...]
+                 (empty list if none).
+        :raise: ResourceProviderListFailed on non-2xx response.
+        """
+        query = 'resource=%s:1' % rc_name
+        rps = self.list_resource_providers(
+            query=query, microversion=microversion)
+        return [{'uuid': rp['uuid'], 'name': rp.get('name')}
+                for rp in rps]
