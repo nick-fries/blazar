@@ -25,6 +25,8 @@ constraints directly on the flavor as resources:* / trait:* extra
 specs, Blazar still pre-flights them correctly.
 """
 
+import urllib.parse
+
 from keystoneauth1 import adapter
 from keystoneauth1.identity import v3
 from keystoneauth1 import session
@@ -124,8 +126,10 @@ class BlazarCyborgClient(object):
         """
         try:
             client = self._create_client()
-            resp = client.get('/v2/device_profiles?name=%s' % name,
-                              raise_exc=False)
+            resp = client.get(
+                '/v2/device_profiles?name=%s'
+                % urllib.parse.quote(str(name), safe=''),
+                raise_exc=False)
         except Exception as exc:
             raise CyborgClientError(
                 "Failed to call Cyborg device_profile API: %s" % exc)

@@ -1042,6 +1042,122 @@ class TestVirtualInstancePlugin(tests.TestCase):
                                                   'reservation-id1')
         mock_update_resource.assert_called_once_with('reservation-id1')
 
+    def test_update_reservation_reapplies_accel_constraints(self):
+        # The update path rebuilds pickup_hosts values from a fixed key
+        # list; the persisted accelerator constraints must be re-injected
+        # or the pre-flight silently disappears on update.
+        plugin = instance_plugin.VirtualInstancePlugin()
+
+        old_reservation = {
+            'id': 'reservation-id1',
+            'status': 'pending',
+            'lease_id': 'lease-id1',
+            'resource_id': 'instance-reservation-id1',
+            'vcpus': 2, 'memory_mb': 1024, 'disk_gb': 100,
+            'amount': 2, 'affinity': False,
+            'resource_properties': ''}
+        self.patch(db_api, 'reservation_get').return_value = old_reservation
+        self.patch(db_api, 'lease_get').return_value = {
+            'start_date': '2020-07-07 18:00',
+            'end_date': '2020-07-07 19:00'}
+        mock_ir_get = self.patch(db_api, 'instance_reservation_get')
+        mock_ir_get.return_value = {
+            'accelerator_constraints': json.dumps({
+                'accelerator_resources': {'PGPU': 1},
+                'required_traits': [],
+                'topology_locality': 'socket'})}
+
+        mock_pickup_hosts = self.patch(plugin, 'pickup_hosts')
+        mock_pickup_hosts.return_value = {
+            'added': set(['host-id1']), 'removed': set()}
+        mock_inst_update = self.patch(db_api, 'instance_reservation_update')
+        self.patch(plugin, 'update_host_allocations')
+        self.patch(plugin, 'update_resources')
+
+        plugin.update_reservation('reservation-id1',
+                                  {'vcpus': 4, 'disk_gb': 200})
+
+        mock_ir_get.assert_called_once_with('instance-reservation-id1')
+        values = mock_pickup_hosts.call_args[0][1]
+        self.assertEqual({'PGPU': 1}, values['accelerator_resources'])
+        self.assertEqual('socket', values['topology_locality'])
+        # Empty list is falsy -> not injected.
+        self.assertNotIn('required_traits', values)
+        # The accel keys must not leak into the DB row update.
+        updated = mock_inst_update.call_args[0][1]
+        self.assertNotIn('accelerator_resources', updated)
+        self.assertNotIn('topology_locality', updated)
+
+    def test_update_reservation_caller_values_not_overwritten(self):
+        # If the caller explicitly passes new accelerator kwargs, the
+        # persisted blob must not clobber them.
+        plugin = instance_plugin.VirtualInstancePlugin()
+
+        old_reservation = {
+            'id': 'reservation-id1',
+            'status': 'pending',
+            'lease_id': 'lease-id1',
+            'resource_id': 'instance-reservation-id1',
+            'vcpus': 2, 'memory_mb': 1024, 'disk_gb': 100,
+            'amount': 2, 'affinity': False,
+            'resource_properties': ''}
+        self.patch(db_api, 'reservation_get').return_value = old_reservation
+        self.patch(db_api, 'lease_get').return_value = {
+            'start_date': '2020-07-07 18:00',
+            'end_date': '2020-07-07 19:00'}
+        self.patch(db_api, 'instance_reservation_get').return_value = {
+            'accelerator_constraints': json.dumps({
+                'accelerator_resources': {'PGPU': 1},
+                'required_traits': ['CUSTOM_OLD'],
+                'topology_locality': 'socket'})}
+
+        mock_pickup_hosts = self.patch(plugin, 'pickup_hosts')
+        mock_pickup_hosts.return_value = {
+            'added': set(['host-id1']), 'removed': set()}
+        self.patch(db_api, 'instance_reservation_update')
+        self.patch(plugin, 'update_host_allocations')
+        self.patch(plugin, 'update_resources')
+
+        plugin.update_reservation(
+            'reservation-id1',
+            {'vcpus': 4, 'accelerator_resources': {'PGPU': 2}})
+
+        values = mock_pickup_hosts.call_args[0][1]
+        self.assertEqual({'PGPU': 2}, values['accelerator_resources'])
+        self.assertEqual(['CUSTOM_OLD'], values['required_traits'])
+
+    def test_select_host_reapplies_accel_constraints(self):
+        # The heal path (_select_host) rebuilds values from a fixed spec
+        # list; persisted accelerator constraints must be re-injected so
+        # a lease is not healed onto a host lacking its accelerators.
+        plugin = instance_plugin.VirtualInstancePlugin()
+
+        reservation = {
+            'id': 'reservation-id1',
+            'resource_id': 'instance-reservation-id1',
+            'vcpus': 2, 'memory_mb': 1024, 'disk_gb': 100,
+            'amount': 1, 'affinity': False,
+            'resource_properties': ''}
+        lease = {'start_date': datetime.datetime(2030, 1, 1, 8, 0),
+                 'end_date': datetime.datetime(2030, 1, 1, 12, 0)}
+        self.patch(db_api, 'instance_reservation_get').return_value = {
+            'accelerator_constraints': json.dumps({
+                'accelerator_resources': {'PGPU': 1},
+                'required_traits': ['CUSTOM_AMD_V620_VF'],
+                'topology_locality': None})}
+        mock_pickup_hosts = self.patch(plugin, 'pickup_hosts')
+        mock_pickup_hosts.return_value = {'added': ['host-id9'],
+                                          'removed': []}
+
+        ret = plugin._select_host(reservation, lease)
+
+        self.assertEqual('host-id9', ret)
+        values = mock_pickup_hosts.call_args[0][1]
+        self.assertEqual({'PGPU': 1}, values['accelerator_resources'])
+        self.assertEqual(['CUSTOM_AMD_V620_VF'], values['required_traits'])
+        # None is falsy -> not injected.
+        self.assertNotIn('topology_locality', values)
+
     def test_update_reservation_not_enough_hosts(self):
         plugin = instance_plugin.VirtualInstancePlugin()
 
@@ -2031,6 +2147,10 @@ class TestTopologyAwareQuery(tests.TestCase):
 
         self.patch(db_utils, 'get_reservations_by_host_id').side_effect = (
             fake_resv_by_host)
+        # One allocation row = one instance slot held on this host.
+        self.patch(db_api,
+                   'host_allocation_get_all_by_values').return_value = (
+            [{'id': 'alloc-1'}])
 
         plugin = instance_plugin.VirtualInstancePlugin()
         plugin.placement_client = FakePlacementClient({
@@ -2082,6 +2202,89 @@ class TestTopologyAwareQuery(tests.TestCase):
                           excludes_res=['r-other'])
         # Assert
         self.assertIn(host, ret)
+
+    @staticmethod
+    def _multi_host_reservation(amount):
+        # A reservation spanning several hosts: ``amount`` is
+        # reservation-wide, per-host share comes from allocation rows.
+        return {
+            'id': 'r-multi', 'lease_id': 'l-multi',
+            'resource_type': instances.RESOURCE_TYPE,
+            'resource_id': 'ir-multi',
+            'instance_reservation': {
+                'amount': amount,
+                'accelerator_constraints': '{"accelerator_resources": '
+                                           '{"PGPU": 1}, '
+                                           '"required_traits": [], '
+                                           '"topology_locality": null}',
+            },
+        }
+
+    def _arrange_committed(self, total_pgpu, other_reservation):
+        host = self._h('h1', 'compute-01')
+        self.patch(db_api, 'reservable_host_get_all_by_queries').return_value\
+            = [host]
+        self.patch(db_utils, 'get_reservations_by_host_id').return_value = (
+            [other_reservation])
+        # max_usages (cpu/mem/disk bin-packing) walks the overlapping
+        # reservation's lease events; nothing to replay here.
+        self.patch(db_api,
+                   'event_get_all_sorted_by_filters').return_value = []
+        plugin = instance_plugin.VirtualInstancePlugin()
+        plugin.placement_client = FakePlacementClient({
+            'compute-01': {
+                'inventory': {'PGPU': {'total': total_pgpu, 'used': 0}},
+                'anchors': set(),
+                'subtree_traits': set(),
+            }})
+        return host, plugin
+
+    def test_committed_counts_per_host_allocation_slots(self):
+        # Arrange: reservation-wide amount=10 but only 2 instance slots
+        # are allocated on *this* host. Host has 3 PGPU; commit must be
+        # 1 PGPU x 2 slots = 2, leaving 1 for a new reservation.
+        # (Charging 1 x 10 against this host would wrongly reject it.)
+        host, plugin = self._arrange_committed(
+            3, self._multi_host_reservation(amount=10))
+        mock_alloc = self.patch(db_api, 'host_allocation_get_all_by_values')
+        mock_alloc.return_value = [{'id': 'a1'}, {'id': 'a2'}]
+
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+
+        # Assert
+        self.assertIn(host, ret)
+        mock_alloc.assert_any_call(reservation_id='r-multi',
+                                   compute_host_id='h1')
+
+    def test_committed_zero_slots_on_host_not_charged(self):
+        # Arrange: the overlapping reservation holds all its slots on
+        # *other* hosts (no allocation rows here) -> commits nothing.
+        host, plugin = self._arrange_committed(
+            1, self._multi_host_reservation(amount=10))
+        self.patch(db_api,
+                   'host_allocation_get_all_by_values').return_value = []
+
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+
+        # Assert
+        self.assertIn(host, ret)
+
+    def test_committed_falls_back_to_amount_on_alloc_read_failure(self):
+        # Arrange: allocation rows unreadable -> conservative fallback
+        # to the reservation-wide amount (2), consuming both PGPUs.
+        host, plugin = self._arrange_committed(
+            2, self._multi_host_reservation(amount=2))
+        self.patch(db_api,
+                   'host_allocation_get_all_by_values').side_effect = (
+            RuntimeError('db down'))
+
+        # Act
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+
+        # Assert
+        self.assertEqual([], ret)
 
     def test_accelerator_aware_disabled_passes_through(self):
         # Arrange: turn off the feature entirely via config.

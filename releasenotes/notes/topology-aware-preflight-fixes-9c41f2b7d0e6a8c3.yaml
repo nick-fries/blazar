@@ -1,0 +1,26 @@
+---
+fixes:
+  - |
+    Fixed an overcounting bug in the accelerator pre-flight for
+    multi-host instance reservations. The committed accelerator usage
+    of an overlapping reservation was previously charged at the full
+    reservation-wide ``amount`` against every candidate host. It is
+    now derived from the number of host allocation rows the
+    reservation actually holds on each host (falling back to the
+    reservation-wide amount only if the allocation rows cannot be
+    read), so feasible hosts are no longer rejected.
+  - |
+    Reservation update and heal (``_select_host``) now re-inject the
+    persisted ``accelerator_constraints`` (accelerator resources,
+    required traits and topology locality) into the host selection
+    query. Previously both paths rebuilt the query values from a fixed
+    key list, silently dropping the accelerator pre-flight and
+    potentially moving a lease onto a host that cannot satisfy it.
+  - |
+    ``parse_flavor_constraints`` now recognises Nova granular request
+    group extra specs (``resources1:``, ``trait1:``, ...) in addition
+    to the unnumbered forms. Counts for the same resource class are
+    summed across groups and duplicate traits are de-duplicated.
+  - |
+    Device profile names are now URL-quoted when querying the Cyborg
+    ``device_profiles`` API.
