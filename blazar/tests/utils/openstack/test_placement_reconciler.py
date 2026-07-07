@@ -153,60 +153,133 @@ class PlacementReconcilerHelpersTest(tests.TestCase):
         out = self.client.list_resource_classes()
         self.assertEqual(['CUSTOM_RESERVATION_AAA'], out)
 
+    # get_allocations_for_class scans per-RP allocations: Placement
+    # has no collection-level GET /allocations endpoint, so the client
+    # enumerates blazar_* RPs (plus the availability filter) and reads
+    # /resource_providers/{uuid}/allocations for each.
+
+    @staticmethod
+    def _rp_body(rps):
+        return fake_requests.FakeResponse(
+            200,
+            content=jsonutils.dump_as_bytes({'resource_providers': rps}))
+
+    @staticmethod
+    def _alloc_body(allocations):
+        return fake_requests.FakeResponse(
+            200,
+            content=jsonutils.dump_as_bytes({'allocations': allocations}))
+
     @mock.patch('keystoneauth1.session.Session.request')
-    def test_get_allocations_for_class_empty(self, kss_req):
-        kss_req.return_value = fake_requests.FakeResponse(
-            200, content=jsonutils.dump_as_bytes({'allocations': []}))
+    def test_get_allocations_for_class_no_blazar_rps(self, kss_req):
+        # Only non-Blazar RPs exist -> nothing to scan, no allocations.
+        rt = _FakeRoundTrip([
+            self._rp_body([{'uuid': 'x1', 'name': 'compute-7',
+                            'generation': 1}]),   # all RPs
+            self._rp_body([]),                    # availability filter
+        ])
+        kss_req.side_effect = rt
         out = self.client.get_allocations_for_class(
             'CUSTOM_RESERVATION_AAA')
         self.assertEqual([], out)
+        # No per-RP allocation reads happened.
+        self.assertEqual(2, len(rt.urls))
 
     @mock.patch('keystoneauth1.session.Session.request')
-    def test_get_allocations_for_class_list_shape(self, kss_req):
-        body = {
-            'allocations': [
-                {'consumer_uuid': 'c1', 'allocations': {}},
-                {'consumer_uuid': 'c2', 'allocations': {}},
-            ]
+    def test_get_allocations_for_class_filters_by_class(self, kss_req):
+        allocs = {
+            'c1': {'resources': {'CUSTOM_RESERVATION_AAA': 1}},
+            'c2': {'resources': {'CUSTOM_RESERVATION_BBB': 1}},
         }
-        kss_req.return_value = fake_requests.FakeResponse(
-            200, content=jsonutils.dump_as_bytes(body))
+        rt = _FakeRoundTrip([
+            self._rp_body([{'uuid': 'u1', 'name': 'blazar_host1',
+                            'generation': 1}]),
+            self._rp_body([{'uuid': 'u1', 'name': 'blazar_host1',
+                            'generation': 1}]),
+            self._alloc_body(allocs),
+        ])
+        kss_req.side_effect = rt
         out = self.client.get_allocations_for_class(
             'CUSTOM_RESERVATION_AAA')
-        self.assertEqual(2, len(out))
+        # Only the consumer holding AAA is reported.
+        self.assertEqual(1, len(out))
+        self.assertEqual('c1', out[0]['consumer_uuid'])
+        self.assertEqual('u1', out[0]['resource_provider'])
+        self.assertEqual('/resource_providers/u1/allocations',
+                         rt.urls[2][0])
+
+    @mock.patch('keystoneauth1.session.Session.request')
+    def test_get_allocations_found_when_availability_filter_empty(
+            self, kss_req):
+        # Fully-consumed inventory: the ?resources= availability filter
+        # returns nothing (no spare capacity), but the blazar_* RP scan
+        # must still find the live consumer. This is the exact case the
+        # allocation gate exists for.
+        allocs = {'c1': {'resources': {'CUSTOM_RESERVATION_AAA': 1}}}
+        rt = _FakeRoundTrip([
+            self._rp_body([{'uuid': 'u1', 'name': 'blazar_host1',
+                            'generation': 1}]),
+            self._rp_body([]),          # availability filter: full RP
+            self._alloc_body(allocs),
+        ])
+        kss_req.side_effect = rt
+        out = self.client.get_allocations_for_class(
+            'CUSTOM_RESERVATION_AAA')
+        self.assertEqual(1, len(out))
         self.assertEqual('c1', out[0]['consumer_uuid'])
 
     @mock.patch('keystoneauth1.session.Session.request')
-    def test_get_allocations_for_class_dict_shape(self, kss_req):
-        body = {
-            'allocations': {
-                'c1': {'resources': {'CUSTOM_RESERVATION_AAA': 1}},
-                'c2': {'resources': {'CUSTOM_RESERVATION_AAA': 1}},
-            }
-        }
-        kss_req.return_value = fake_requests.FakeResponse(
-            200, content=jsonutils.dump_as_bytes(body))
+    def test_get_allocations_for_class_multiple_rps(self, kss_req):
+        rt = _FakeRoundTrip([
+            self._rp_body([
+                {'uuid': 'u1', 'name': 'blazar_host1', 'generation': 1},
+                {'uuid': 'u2', 'name': 'blazar_host2', 'generation': 1},
+                {'uuid': 'x1', 'name': 'compute-7', 'generation': 1},
+            ]),
+            self._rp_body([]),
+            self._alloc_body({}),      # u1: no allocations
+            self._alloc_body({'c9': {'resources':
+                                     {'CUSTOM_RESERVATION_AAA': 2}}}),
+        ])
+        kss_req.side_effect = rt
         out = self.client.get_allocations_for_class(
             'CUSTOM_RESERVATION_AAA')
-        self.assertEqual(2, len(out))
-        consumers = sorted(a['consumer_uuid'] for a in out)
-        self.assertEqual(['c1', 'c2'], consumers)
+        self.assertEqual(1, len(out))
+        self.assertEqual('c9', out[0]['consumer_uuid'])
+        # Non-blazar RP x1 was never scanned.
+        scanned = [u for u, _ in rt.urls if u.endswith('/allocations')]
+        self.assertEqual(['/resource_providers/u1/allocations',
+                          '/resource_providers/u2/allocations'],
+                         sorted(scanned))
 
     @mock.patch('keystoneauth1.session.Session.request')
     def test_get_allocations_for_class_raises_on_5xx(self, kss_req):
-        kss_req.return_value = fake_requests.FakeResponse(500)
+        rt = _FakeRoundTrip([
+            self._rp_body([{'uuid': 'u1', 'name': 'blazar_host1',
+                            'generation': 1}]),
+            self._rp_body([]),
+            fake_requests.FakeResponse(500),
+        ])
+        kss_req.side_effect = rt
         self.assertRaises(
             exceptions.ResourceClassListFailed,
             self.client.get_allocations_for_class,
             'CUSTOM_RESERVATION_AAA')
 
     @mock.patch('keystoneauth1.session.Session.request')
-    def test_get_allocations_for_class_url_includes_filter(self, kss_req):
-        kss_req.return_value = fake_requests.FakeResponse(
-            200, content=jsonutils.dump_as_bytes({'allocations': []}))
+    def test_get_allocations_never_uses_collection_endpoint(self, kss_req):
+        # Regression guard: GET /allocations?... does not exist in the
+        # Placement API and must never be requested.
+        rt = _FakeRoundTrip([
+            self._rp_body([{'uuid': 'u1', 'name': 'blazar_host1',
+                            'generation': 1}]),
+            self._rp_body([]),
+            self._alloc_body({}),
+        ])
+        kss_req.side_effect = rt
         self.client.get_allocations_for_class('CUSTOM_RESERVATION_AAA')
-        args, _ = kss_req.call_args
-        self.assertIn('resource_class=CUSTOM_RESERVATION_AAA', args[0])
+        for url, _ in rt.urls:
+            self.assertFalse(url.startswith('/allocations'))
 
     @mock.patch('keystoneauth1.session.Session.request')
     def test_list_rps_with_inventory_empty(self, kss_req):
@@ -235,11 +308,13 @@ class PlacementReconcilerHelpersTest(tests.TestCase):
             out)
 
     @mock.patch('keystoneauth1.session.Session.request')
-    def test_list_rps_with_inventory_uses_resource_filter(self, kss_req):
+    def test_list_rps_with_inventory_uses_resources_filter(self, kss_req):
+        # Placement's parameter is the plural 'resources='. The singular
+        # 'resource=' is unknown to the API and returns HTTP 400.
         kss_req.return_value = fake_requests.FakeResponse(
             200,
             content=jsonutils.dump_as_bytes({'resource_providers': []}))
         self.client.list_resource_providers_with_inventory(
             'CUSTOM_RESERVATION_AAA')
         args, _ = kss_req.call_args
-        self.assertIn('resource=CUSTOM_RESERVATION_AAA:1', args[0])
+        self.assertIn('resources=CUSTOM_RESERVATION_AAA:1', args[0])

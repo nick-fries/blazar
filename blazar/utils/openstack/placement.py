@@ -700,59 +700,90 @@ class BlazarPlacementClient(object):
                                   microversion=PLACEMENT_MICROVERSION):
         """Return live allocations referencing the given resource class.
 
-        Calls GET /allocations?resource_class=<rc_name>. Returns a list
-        of consumer entries shaped like
-        ``[{"consumer_uuid": "...", "allocations": {...}}, ...]``.
-        An empty list means no consumer holds the class (safe to
-        delete). A non-2xx response raises so the caller can skip the
-        cycle rather than silently deleting an in-use class.
+        Placement has NO collection-level ``GET /allocations`` endpoint
+        -- allocations can only be read per consumer
+        (``/allocations/{consumer_uuid}``) or per resource provider
+        (``/resource_providers/{uuid}/allocations``). We therefore
+        enumerate the candidate providers and scan each provider's
+        allocations for consumers holding ``rc_name``.
+
+        Candidate providers are every Blazar child RP (named
+        ``blazar_<host>`` -- the only place Blazar ever creates
+        reservation-class inventory, and allocations require inventory
+        on the same RP) plus, defensively, any provider the
+        availability filter ``?resources=<rc>:1`` returns (in case an
+        operator hand-created inventory elsewhere). Note the
+        availability filter alone would be unsafe: it misses providers
+        whose inventory is fully consumed, which is exactly the state
+        this gate exists to catch.
+
+        Returns a list of consumer entries shaped like
+        ``[{"consumer_uuid": "...", "resources": {...},
+        "resource_provider": "<rp_uuid>"}, ...]``. An empty list means
+        no consumer holds the class (safe to delete). Any read failure
+        raises so the caller can skip the class rather than silently
+        deleting an in-use one.
 
         :param rc_name: resource class name (e.g.
                         ``CUSTOM_RESERVATION_<UUID>``)
         :return: list[dict]
         :raise: ResourceClassListFailed on non-2xx response.
         """
-        resp = self.get(
-            '/allocations?resource_class=%s' % rc_name,
-            microversion=microversion)
-        if not resp:
-            msg = ("Failed to list allocations for resource class "
-                   "%(rc)s. Got %(status_code)d: %(err_text)s.")
-            args = {
-                'rc': rc_name,
-                'status_code': resp.status_code,
-                'err_text': resp.text,
-            }
-            LOG.error(msg, args)
-            raise exceptions.ResourceClassListFailed()
-        body = resp.json() or {}
-        # Placement returns either a flat list or a dict keyed by
-        # consumer uuid depending on microversion / variant. Normalise
-        # both shapes to a list of consumer records so callers don't
-        # need to special-case it.
-        raw = body.get('allocations', body)
-        if isinstance(raw, dict):
-            return [{'consumer_uuid': cuid, 'allocations': alloc}
-                    for cuid, alloc in raw.items()]
-        if isinstance(raw, list):
-            return list(raw)
-        return []
+        # Build the candidate RP set.
+        candidates = {}
+        for rp in self.list_resource_providers(microversion=microversion):
+            if (rp.get('name') or '').startswith('blazar_'):
+                candidates[rp['uuid']] = rp
+        for rp in self.list_resource_providers_with_inventory(
+                rc_name, microversion=microversion):
+            candidates.setdefault(rp['uuid'], rp)
+
+        out = []
+        for rp_uuid in sorted(candidates):
+            resp = self.get('/resource_providers/%s/allocations' % rp_uuid,
+                            microversion=microversion)
+            if not resp:
+                msg = ("Failed to list allocations on resource provider "
+                       "%(rp)s while checking resource class %(rc)s. "
+                       "Got %(status_code)d: %(err_text)s.")
+                args = {
+                    'rp': rp_uuid,
+                    'rc': rc_name,
+                    'status_code': resp.status_code,
+                    'err_text': resp.text,
+                }
+                LOG.error(msg, args)
+                raise exceptions.ResourceClassListFailed()
+            body = resp.json() or {}
+            for cuid, alloc in (body.get('allocations') or {}).items():
+                if rc_name in (alloc.get('resources') or {}):
+                    out.append({'consumer_uuid': cuid,
+                                'resources': alloc.get('resources'),
+                                'resource_provider': rp_uuid})
+        return out
 
     def list_resource_providers_with_inventory(
             self, rc_name, microversion=PLACEMENT_MICROVERSION):
-        """Return RPs that carry inventory of the given resource class.
+        """Return RPs able to serve one unit of the given resource class.
 
-        Calls GET /resource_providers?resource=<rc>:1. Used by the
+        Calls GET /resource_providers?resources=<rc>:1. Used by the
         reconciler to find every host RP whose inventory still
         references an orphan CUSTOM_RESERVATION_<uuid> class so each
         can be cleared before the class itself is dropped.
+
+        NOTE: the ``resources=`` filter is availability-based (capacity
+        for the requested amount), not presence-based, so a provider
+        whose inventory of ``rc_name`` is fully consumed is NOT
+        returned. In the reconciler this helper only runs after the
+        allocation gate has established used == 0, at which point
+        availability and presence coincide.
 
         :param rc_name: resource class name
         :return: list of dicts: [{'uuid': str, 'name': str}, ...]
                  (empty list if none).
         :raise: ResourceProviderListFailed on non-2xx response.
         """
-        query = 'resource=%s:1' % rc_name
+        query = 'resources=%s:1' % rc_name
         rps = self.list_resource_providers(
             query=query, microversion=microversion)
         return [{'uuid': rp['uuid'], 'name': rp.get('name')}

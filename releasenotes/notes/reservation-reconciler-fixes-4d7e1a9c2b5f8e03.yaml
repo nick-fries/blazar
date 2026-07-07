@@ -1,0 +1,34 @@
+---
+fixes:
+  - |
+    The orphan-reservation reconciler's allocation gate no longer
+    queries the nonexistent Placement collection endpoint
+    ``GET /allocations?resource_class=...``. Allocations for a
+    ``CUSTOM_RESERVATION_<uuid>`` class are now discovered by scanning
+    ``GET /resource_providers/{uuid}/allocations`` across the union of
+    all ``blazar_*`` reservation providers and any providers reporting
+    inventory of the class. Any read failure raises and the class is
+    skipped for the cycle (fail-safe: never delete on incomplete
+    information).
+  - |
+    ``list_resource_providers_with_inventory`` sent the unknown query
+    parameter ``resource=`` (singular), which Placement rejects with
+    HTTP 400. It now sends ``resources=<class>:1``. Note this filter is
+    availability-based; it is used only after the allocation gate has
+    proven the class unused, where availability equals presence.
+  - |
+    A forced CLI run (``blazar-reconcile-reservations --lease-uuid``)
+    no longer resets the grace-period clock of every other outstanding
+    orphan: end-of-cycle bookkeeping now prunes against the full orphan
+    set rather than the force-filtered working set. Successful
+    deletions also clear their own grace entry immediately.
+  - |
+    Audit rows written during ``--dry-run`` are now tagged
+    ``triggered_by='cli-dry-run'`` so the ``class_deleted`` rows the
+    dry-run wrapper still records cannot be mistaken for real
+    deletions.
+  - |
+    Added indexes on ``created_at``, ``reservation_id`` and
+    ``resource_class_name`` to the ``reservation_cleanup_logs`` table
+    to keep operator time-window and per-reservation queries from
+    scanning the full table.

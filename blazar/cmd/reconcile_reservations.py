@@ -102,7 +102,12 @@ def main():
     force_uuids = list(CONF.lease_uuid) if CONF.lease_uuid else None
     reconciler = reservation_reconciler.ReservationReconciler(
         placement_client=client)
-    summary = reconciler.reconcile(triggered_by='cli',
+    # Under --dry-run the destructive placement calls are no-ops but
+    # the reconciler still walks the full path and writes audit rows
+    # (including 'class_deleted'). Tag those rows so they can't be
+    # mistaken for real deletions.
+    triggered_by = 'cli-dry-run' if CONF.dry_run else 'cli'
+    summary = reconciler.reconcile(triggered_by=triggered_by,
                                    force_uuids=force_uuids)
 
     # Print to stdout for operator-facing tooling. The audit-log row

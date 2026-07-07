@@ -53,6 +53,13 @@ def upgrade():
         sa.Column('details', MediumText(), nullable=True),
         sa.PrimaryKeyConstraint('id')
     )
+    # Operator queries are by time window, reservation, or class name.
+    op.create_index('reservation_cleanup_logs_created_at_idx',
+                    'reservation_cleanup_logs', ['created_at'])
+    op.create_index('reservation_cleanup_logs_reservation_id_idx',
+                    'reservation_cleanup_logs', ['reservation_id'])
+    op.create_index('reservation_cleanup_logs_resource_class_name_idx',
+                    'reservation_cleanup_logs', ['resource_class_name'])
 
 
 def downgrade():

@@ -391,6 +391,16 @@ class ReservationCleanupLog(mb.BlazarBase):
     append-only -- no UPDATE or DELETE paths exist in normal operation.
     """
     __tablename__ = 'reservation_cleanup_logs'
+    # Operators query this table by time window, by reservation, or by
+    # class name; index the three lookup columns (append-only table,
+    # write amplification is not a concern).
+    __table_args__ = (
+        sa.Index('reservation_cleanup_logs_created_at_idx', 'created_at'),
+        sa.Index('reservation_cleanup_logs_reservation_id_idx',
+                 'reservation_id'),
+        sa.Index('reservation_cleanup_logs_resource_class_name_idx',
+                 'resource_class_name'),
+    )
 
     id = _id_column()
     # The reservation UUID extracted from the resource class name. May
@@ -401,7 +411,7 @@ class ReservationCleanupLog(mb.BlazarBase):
     # detected | class_deleted | skipped_allocations | skipped_grace
     # | error
     action = sa.Column(sa.String(32), nullable=False)
-    # periodic | cli
+    # periodic | cli | cli-dry-run
     triggered_by = sa.Column(sa.String(16), nullable=False)
     # Free-form JSON payload: hosts touched, allocation count, error
     # message, etc. See blazar.manager.reservation_reconciler for the

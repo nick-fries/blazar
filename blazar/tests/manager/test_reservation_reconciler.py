@@ -238,6 +238,20 @@ class ReconcilerGracePeriodTest(tests.TestCase):
         self.assertNotIn(self.rc_name, rec._seen_orphans)
         self.assertEqual(0, len(placement.deleted_classes))
 
+    def test_delete_clears_seen_state_same_cycle(self):
+        # The successful-delete path must pop the grace entry itself.
+        # Step-7 pruning alone can't: all_orphans was computed before
+        # the delete, so the class is still in it during this cycle.
+        placement = self._orphan_setup()
+        db = _FakeDB(live_uuids=[])
+        clock = _Clock()
+        rec = _make_reconciler(placement, db, clock)
+        rec.reconcile()
+        clock.advance(601)
+        summary = rec.reconcile()
+        self.assertEqual(1, summary['deleted'])
+        self.assertNotIn(self.rc_name, rec._seen_orphans)
+
     def test_zero_grace_period_deletes_second_cycle(self):
         self.cfg.config(group='reservation_reconciler',
                         orphan_grace_period_seconds=0)
@@ -584,6 +598,32 @@ class ReconcilerForceUuidsTest(tests.TestCase):
         self.assertEqual(1, summary['detected'])
         self.assertEqual(1, summary['deleted'])
 
+    def test_force_run_preserves_other_orphans_grace_clock(self):
+        # Step-7 pruning must compare against every class still
+        # orphaned, not just the force-filtered working set --
+        # otherwise a forced CLI run resets the grace clock of every
+        # other orphan and indefinitely defers their cleanup.
+        other = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        other_rc = _rc(other)
+        placement = _FakePlacement()
+        placement.classes = {self.rc_name, other_rc}
+        db = _FakeDB(live_uuids=[])
+        clock = _Clock()
+        rec = _make_reconciler(placement, db, clock)
+        # Periodic sighting starts both grace clocks.
+        rec.reconcile()
+        first_seen = rec._seen_orphans[other_rc]
+        # Forced run on one class only.
+        clock.advance(60)
+        rec.reconcile(triggered_by='cli', force_uuids=[self.uuid])
+        self.assertEqual([self.rc_name], placement.deleted_classes)
+        self.assertEqual(first_seen, rec._seen_orphans.get(other_rc))
+        # The preserved clock lets the other orphan delete on schedule.
+        clock.advance(541)  # 601s total since first sighting
+        summary = rec.reconcile()
+        self.assertEqual(1, summary['deleted'])
+        self.assertIn(other_rc, placement.deleted_classes)
+
 
 class ReconcilerMultiCycleTest(tests.TestCase):
     def setUp(self):
@@ -657,3 +697,11 @@ class RCNameHelpersTest(tests.TestCase):
     def test_uuid_from_malformed_tail_is_none(self):
         out = rr._uuid_from_rc_name('CUSTOM_RESERVATION_HELLO')
         self.assertIsNone(out)
+
+    def test_uuid_from_wrong_shape_tail_is_none(self):
+        # 36 chars but not underscore-separated like a UUID.
+        self.assertIsNone(
+            rr._uuid_from_rc_name('CUSTOM_RESERVATION_' + 'A' * 36))
+        # Four underscores but wrong overall length.
+        self.assertIsNone(rr._uuid_from_rc_name(
+            'CUSTOM_RESERVATION_AAAA_BBBB_CCCC_DDDD_EEEE'))

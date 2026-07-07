@@ -79,17 +79,31 @@ def _uuid_from_rc_name(rc_name):
     if not rc_name or not rc_name.startswith(RESERVATION_RC_PREFIX):
         return None
     tail = rc_name[len(RESERVATION_RC_PREFIX):]
-    if len(tail) != 36 and tail.count('_') != 4:
+    if len(tail) != 36 or tail.count('_') != 4:
         # Not a uuid-shaped tail. Could happen if an operator made
         # other CUSTOM_RESERVATION_* classes by hand; we still record
         # the row but with a NULL reservation_id.
-        if tail.count('_') != 4:
-            return None
+        return None
     return tail.lower().replace('_', '-')
 
 
 class ReservationReconciler(object):
     """Find and reclaim orphan CUSTOM_RESERVATION_<uuid> classes.
+
+    Grace-period state (``_seen_orphans``) is **in-memory and
+    per-process**. Consequences operators should know about:
+
+    * A blazar-manager restart resets every orphan's grace clock; an
+      orphan is only deleted after it has been continuously observed
+      by the *same* process for the full grace period.
+    * The ``blazar-reconcile-reservations`` CLI runs in its own
+      process and shares no grace state with the periodic task. A
+      plain CLI run therefore only ever *detects* orphans (first
+      sighting); use ``--lease-uuid`` to actually force-clean one.
+
+    This is deliberate: Blazar runs a single manager, and keeping the
+    state off the DB means a crashed cycle can never leave a stale
+    "safe to delete" verdict behind.
 
     :param placement_client: a
         :class:`blazar.utils.openstack.placement.BlazarPlacementClient`
@@ -174,8 +188,14 @@ class ReservationReconciler(object):
         known_rcs = {_rc_name_for_uuid(u) for u in live_uuids}
 
         # Step 3: set difference -- everything in Placement that we
-        # have no DB row for.
-        orphans = placement_rcs - known_rcs
+        # have no DB row for. Keep the full set separate from the
+        # (possibly force-filtered) working set: the grace-period
+        # bookkeeping in step 7 must prune against everything that is
+        # still orphaned, not just what this cycle acted on, or a
+        # forced CLI run would reset the grace clock of every other
+        # orphan.
+        all_orphans = placement_rcs - known_rcs
+        orphans = all_orphans
 
         # Step 4: optional intersection with force_uuids (CLI path).
         force_set = None
@@ -357,14 +377,18 @@ class ReservationReconciler(object):
                 "%s (triggered_by=%s, hosts_cleared=%d)",
                 rc_name, triggered_by, len(hosts_cleared))
             summary['deleted'] += 1
+            self._seen_orphans.pop(rc_name, None)
             self._log_action(
                 rc_name=rc_name, action='class_deleted',
                 triggered_by=triggered_by,
                 details={'hosts_cleared': hosts_cleared,
                          'hosts_failed': hosts_failed})
 
-        # Step 7: forget entries that are no longer orphaned.
-        for stale in [k for k in self._seen_orphans if k not in orphans]:
+        # Step 7: forget entries that are no longer orphaned. Compare
+        # against the full orphan set, not the force-filtered working
+        # set (see step 3).
+        for stale in [k for k in self._seen_orphans
+                      if k not in all_orphans]:
             del self._seen_orphans[stale]
 
         LOG.warning(

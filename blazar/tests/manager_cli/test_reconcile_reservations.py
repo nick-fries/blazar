@@ -114,6 +114,23 @@ class CLIMainTest(tests.TestCase):
                 ctor_kwargs['placement_client'],
                 cmd._DryRunPlacementClient)
 
+    def test_main_dry_run_tags_triggered_by(self):
+        # The dry-run wrapper no-ops the destructive placement calls,
+        # but the reconciler still writes 'class_deleted' audit rows.
+        # Those rows must be distinguishable from real deletions.
+        p_svc, p_db, p_cli, p_rec, p_argv, p_out = _patches_for_main(
+            ['--dry-run'], {})
+        with p_svc, p_db, p_cli, p_rec as fake_rec_cls, p_argv, p_out:
+            fake_rec_cls.return_value.reconcile.return_value = {
+                'detected': 0, 'deleted': 0,
+                'skipped_allocations': 0, 'skipped_grace': 0,
+                'errors': 0,
+            }
+            cmd.main()
+            call = fake_rec_cls.return_value.reconcile.call_args
+            self.assertEqual('cli-dry-run',
+                             call.kwargs.get('triggered_by'))
+
     def test_main_passes_force_uuids(self):
         _, _, fake_rec, _ = self._run_main(
             ['--lease-uuid', 'aaa-111', '--lease-uuid', 'bbb-222'])
