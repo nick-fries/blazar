@@ -14,6 +14,7 @@
 
 import collections
 import datetime
+import re
 import retrying
 
 from novaclient import exceptions as nova_exceptions
@@ -70,6 +71,18 @@ TOPOLOGY_ANCHOR_TRAITS = {
 RESERVATION_PREFIX = 'reservation'
 FLAVOR_EXTRA_SPEC = "aggregate_instance_extra_specs:" + RESERVATION_PREFIX
 INSTANCE_DELETION_TIMEOUT = 10 * 60 * 1000  # 10 minutes
+
+# Gap G1: extra-spec keys copied from the *source* flavor (the one named
+# by ``flavor_id`` at reservation time) onto the per-reservation flavor,
+# so that instances booted with the reservation flavor actually get the
+# accelerators the pre-flight reserved capacity for. Without this the
+# reservation flavor carries only the reservation fence and Nova never
+# creates the Cyborg ARQs / granular request groups.
+#   - accel:device_profile  -> Cyborg ARQ flow
+#   - resources:/resourcesN: and trait:/traitN:   -> granular groups
+#   - group_policy          -> required when multiple granular groups
+_ACCEL_FLAVOR_SPEC_RE = re.compile(
+    r'^(accel:device_profile$|resources\d*:|trait\d*:|group_policy$)')
 
 NONE_VALUES = ('None', 'none', None)
 QUERY_TYPE_ALLOCATION = 'allocation'
@@ -469,6 +482,11 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             return None
         raw = ir['accelerator_constraints'] if isinstance(ir, dict) else (
             getattr(ir, 'accelerator_constraints', None))
+        return VirtualInstancePlugin._loads_accel_blob(raw)
+
+    @staticmethod
+    def _loads_accel_blob(raw):
+        """Parse a raw accelerator_constraints column value (or dict)."""
         if not raw:
             return None
         if isinstance(raw, (dict,)):
@@ -575,8 +593,48 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
 
         return {'added': added_host_ids, 'removed': removed_host_ids}
 
+    def _source_flavor_accel_specs(self, accel_blob):
+        """Extra specs to copy from the source flavor onto the
+        reservation flavor (gap G1).
+
+        ``accel_blob`` is the parsed ``accelerator_constraints`` dict
+        persisted at reservation-create time; its ``flavor_id`` names
+        the source flavor the user reserved with. We re-read that
+        flavor's extra specs and keep only the accelerator-relevant
+        keys (see _ACCEL_FLAVOR_SPEC_RE). Reservation-owned keys are
+        never produced here and always win at the call site.
+
+        Returns {} on any failure: the reservation flavor must still
+        be created even if the source flavor has since been deleted —
+        the operator just loses accelerator propagation, which we log.
+        """
+        if not accel_blob:
+            return {}
+        flavor_id = accel_blob.get('flavor_id')
+        if not flavor_id:
+            return {}
+        try:
+            _standard, extra = nova.FlavorAccessor().get_flavor(flavor_id)
+        except Exception:
+            LOG.warning(
+                "Gap G1: source flavor %s could not be read; the "
+                "reservation flavor will NOT carry its accelerator "
+                "extra specs (accel:device_profile / resources* / "
+                "trait*). Instances booted with the reservation "
+                "flavor will get no accelerators.", flavor_id,
+                exc_info=True)
+            return {}
+        specs = {}
+        for key, value in (extra or {}).items():
+            if 'CUSTOM_RESERVATION_' in key:
+                # never inherit another reservation's fence
+                continue
+            if _ACCEL_FLAVOR_SPEC_RE.match(key):
+                specs[key] = value
+        return specs
+
     def _create_flavor(self, reservation_id, vcpus, memory, disk,
-                       group_id=None):
+                       group_id=None, accel_extra_specs=None):
         flavor_details = {
             'flavorid': reservation_id,
             'name': RESERVATION_PREFIX + ":" + reservation_id,
@@ -587,13 +645,14 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             }
         reserved_flavor = self.nova.nova.flavors.create(**flavor_details)
 
-        # Set extra specs to the flavor
+        # Set extra specs to the flavor. Accelerator specs copied from
+        # the source flavor (gap G1) go first; reservation-owned keys
+        # are applied afterwards so they always win on conflict.
+        extra_specs = dict(accel_extra_specs or {})
         rsv_id_rc_format = reservation_id.upper().replace("-", "_")
         reservation_rc = "resources:CUSTOM_RESERVATION_" + rsv_id_rc_format
-        extra_specs = {
-            FLAVOR_EXTRA_SPEC: reservation_id,
-            reservation_rc: "1"
-            }
+        extra_specs[FLAVOR_EXTRA_SPEC] = reservation_id
+        extra_specs[reservation_rc] = "1"
         if group_id is not None:
             extra_specs["affinity_id"] = group_id
         reserved_flavor.set_keys(extra_specs)
@@ -610,7 +669,15 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             'reservation_id': reservation_id,
             'vcpus': inst_reservation['vcpus'],
             'memory': inst_reservation['memory_mb'],
-            'disk': inst_reservation['disk_gb']
+            'disk': inst_reservation['disk_gb'],
+            # Gap G1: carry the source flavor's accelerator extra
+            # specs onto the reservation flavor.
+            'accel_extra_specs': self._source_flavor_accel_specs(
+                self._loads_accel_blob(
+                    inst_reservation.get('accelerator_constraints')
+                    if isinstance(inst_reservation, dict)
+                    else getattr(inst_reservation,
+                                 'accelerator_constraints', None)))
         }
 
         pool_metadata = {
@@ -691,11 +758,16 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
         else:
             try:
                 self.nova.nova.flavors.delete(reservation['id'])
+                # Gap G1: re-read persisted accelerator constraints so
+                # the re-created flavor keeps the accelerator specs.
+                accel_specs = self._source_flavor_accel_specs(
+                    self._fetch_reservation_accel_blob(reservation))
                 self._create_flavor(reservation['id'],
                                     reservation['vcpus'],
                                     reservation['memory_mb'],
                                     reservation['disk_gb'],
-                                    reservation['server_group_id'])
+                                    reservation['server_group_id'],
+                                    accel_extra_specs=accel_specs)
             except nova_exceptions.ClientException:
                 LOG.exception("Failed to update Nova resources "
                               "for reservation %s", reservation['id'])

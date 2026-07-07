@@ -2498,3 +2498,161 @@ class TestReserveResourceWithFlavor(tests.TestCase):
         self.assertFalse(fa.called)
         recorded = self.mock_inst_create.call_args[0][0]
         self.assertNotIn('accelerator_constraints', recorded)
+
+
+class TestReservationFlavorAccelSpecs(tests.TestCase):
+    """Gap G1: the reservation flavor must inherit the source flavor's
+    accelerator extra specs (accel:device_profile / resources* /
+    trait* / group_policy), with reservation-owned keys winning."""
+
+    def _plugin_with_flavor_mocks(self):
+        plugin = instance_plugin.VirtualInstancePlugin()
+        fake_flavor = mock.MagicMock(flavorid='res-1')
+        mock_nova = mock.MagicMock()
+        type(plugin).nova = mock_nova
+        mock_nova.nova.flavors.create.return_value = fake_flavor
+        return plugin, fake_flavor
+
+    def test_source_flavor_accel_specs_filters_keys(self):
+        plugin = instance_plugin.VirtualInstancePlugin()
+        fa = self.patch(nova, 'FlavorAccessor')
+        fa.return_value.get_flavor.return_value = (
+            {'vcpus': 4, 'memory_mb': 8192, 'disk_gb': 20},
+            {'accel:device_profile': 'amd-v620-vf',
+             'resources:VGPU': '1',
+             'resources1:CUSTOM_FOO': '2',
+             'trait:CUSTOM_SOCKET_ROOT': 'required',
+             'trait2:HW_NUMA_ROOT': 'required',
+             'group_policy': 'none',
+             'resources:CUSTOM_RESERVATION_OLD': '1',   # never inherited
+             'hw:cpu_policy': 'dedicated',              # not accel-owned
+             'aggregate_instance_extra_specs:reservation': 'old-id'})
+
+        specs = plugin._source_flavor_accel_specs({'flavor_id': 'flavor-1'})
+
+        self.assertEqual(
+            {'accel:device_profile': 'amd-v620-vf',
+             'resources:VGPU': '1',
+             'resources1:CUSTOM_FOO': '2',
+             'trait:CUSTOM_SOCKET_ROOT': 'required',
+             'trait2:HW_NUMA_ROOT': 'required',
+             'group_policy': 'none'},
+            specs)
+
+    def test_source_flavor_accel_specs_empty_blob(self):
+        plugin = instance_plugin.VirtualInstancePlugin()
+        fa = self.patch(nova, 'FlavorAccessor')
+        self.assertEqual({}, plugin._source_flavor_accel_specs(None))
+        self.assertEqual({}, plugin._source_flavor_accel_specs({}))
+        self.assertFalse(fa.called)
+
+    def test_source_flavor_accel_specs_lookup_failure_returns_empty(self):
+        plugin = instance_plugin.VirtualInstancePlugin()
+        fa = self.patch(nova, 'FlavorAccessor')
+        fa.return_value.get_flavor.side_effect = (
+            nova_exceptions.ClientException(500))
+        self.assertEqual(
+            {}, plugin._source_flavor_accel_specs({'flavor_id': 'gone'}))
+
+    def test_create_flavor_merges_accel_specs_reservation_keys_win(self):
+        plugin, fake_flavor = self._plugin_with_flavor_mocks()
+
+        plugin._create_flavor(
+            'res-1', 4, 8192, 20,
+            accel_extra_specs={
+                'accel:device_profile': 'amd-v620-vf',
+                'trait:CUSTOM_SOCKET_ROOT': 'required',
+                # hostile input: must be overridden by reservation keys
+                'aggregate_instance_extra_specs:reservation': 'spoof',
+                'resources:CUSTOM_RESERVATION_RES_1': '9'})
+
+        fake_flavor.set_keys.assert_called_once_with(
+            {'accel:device_profile': 'amd-v620-vf',
+             'trait:CUSTOM_SOCKET_ROOT': 'required',
+             'aggregate_instance_extra_specs:reservation': 'res-1',
+             'resources:CUSTOM_RESERVATION_RES_1': '1'})
+
+    def test_create_resources_propagates_accel_specs(self):
+        instance_reservation = {
+            'reservation_id': 'res-1',
+            'vcpus': 4,
+            'memory_mb': 8192,
+            'disk_gb': 20,
+            'affinity': None,
+            'accelerator_constraints': json.dumps(
+                {'flavor_id': 'flavor-1',
+                 'accelerator_resources': {'PGPU': 1},
+                 'required_traits': [],
+                 'topology_locality': None}),
+            }
+        plugin, fake_flavor = self._plugin_with_flavor_mocks()
+        self.set_context(context.BlazarContext(project_id='fake-project',
+                                               auth_token='fake-token'))
+        self.patch(nova, 'NovaClientWrapper')
+        fa = self.patch(nova, 'FlavorAccessor')
+        fa.return_value.get_flavor.return_value = (
+            {'vcpus': 4, 'memory_mb': 8192, 'disk_gb': 20},
+            {'accel:device_profile': 'amd-v620-vf'})
+        self.patch(plugin.placement_client, 'create_reservation_class')
+        fake_pool = mock.MagicMock(id='pool-id1')
+        mock_pool = self.patch(nova, 'ReservationPool')
+        mock_pool.return_value = fake_pool
+
+        plugin._create_resources(instance_reservation)
+
+        fake_flavor.set_keys.assert_called_once_with(
+            {'accel:device_profile': 'amd-v620-vf',
+             'aggregate_instance_extra_specs:reservation': 'res-1',
+             'resources:CUSTOM_RESERVATION_RES_1': '1'})
+
+    def test_create_resources_without_constraints_unchanged(self):
+        instance_reservation = {
+            'reservation_id': 'res-1',
+            'vcpus': 2,
+            'memory_mb': 1024,
+            'disk_gb': 20,
+            'affinity': None,
+            }
+        plugin, fake_flavor = self._plugin_with_flavor_mocks()
+        self.set_context(context.BlazarContext(project_id='fake-project',
+                                               auth_token='fake-token'))
+        self.patch(nova, 'NovaClientWrapper')
+        fa = self.patch(nova, 'FlavorAccessor')
+        self.patch(plugin.placement_client, 'create_reservation_class')
+        mock_pool = self.patch(nova, 'ReservationPool')
+        mock_pool.return_value = mock.MagicMock(id='pool-id1')
+
+        plugin._create_resources(instance_reservation)
+
+        self.assertFalse(fa.called)
+        fake_flavor.set_keys.assert_called_once_with(
+            {'aggregate_instance_extra_specs:reservation': 'res-1',
+             'resources:CUSTOM_RESERVATION_RES_1': '1'})
+
+    def test_update_resources_recreates_flavor_with_accel_specs(self):
+        plugin, fake_flavor = self._plugin_with_flavor_mocks()
+        mock_res_get = self.patch(db_api, 'reservation_get')
+        mock_res_get.return_value = {
+            'id': 'res-1',
+            'status': 'pending',
+            'vcpus': 4,
+            'memory_mb': 8192,
+            'disk_gb': 20,
+            'server_group_id': None,
+            'resource_id': 'inst-res-1',
+            }
+        mock_ir_get = self.patch(db_api, 'instance_reservation_get')
+        mock_ir_get.return_value = {
+            'accelerator_constraints': json.dumps(
+                {'flavor_id': 'flavor-1'})}
+        fa = self.patch(nova, 'FlavorAccessor')
+        fa.return_value.get_flavor.return_value = (
+            {'vcpus': 4, 'memory_mb': 8192, 'disk_gb': 20},
+            {'accel:device_profile': 'amd-v620-vf'})
+
+        plugin.update_resources('res-1')
+
+        fake_flavor.set_keys.assert_called_once_with(
+            {'accel:device_profile': 'amd-v620-vf',
+             'aggregate_instance_extra_specs:reservation': 'res-1',
+             'resources:CUSTOM_RESERVATION_RES_1': '1'})
