@@ -699,6 +699,70 @@ class TestParseFlavorConstraints(tests.TestCase):
         self.assertNotIn('PGPU', result['accelerator_resources'])
         self.assertEqual(3, result['accelerator_resources']['CUSTOM_FPGA'])
 
+    # ---- Nova granular request groups (numbered suffixes) --------------
+
+    def test_numbered_resources_group_extracted(self):
+        # Nova granular groups use numbered prefixes: resources1:,
+        # resources2:, ... They must count like the unnumbered form.
+        # Arrange / Act
+        result = nova.parse_flavor_constraints(
+            {'resources1:CUSTOM_AMD_V620_VF': '1'})
+        # Assert
+        self.assertEqual({'CUSTOM_AMD_V620_VF': 1},
+                         result['accelerator_resources'])
+
+    def test_numbered_and_unnumbered_resources_summed(self):
+        # The pre-flight is host-level, so counts for the same resource
+        # class merge across groups.
+        # Arrange
+        extra_specs = {'resources:PGPU': '1',
+                       'resources1:PGPU': '1',
+                       'resources2:PGPU': '2'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert
+        self.assertEqual({'PGPU': 4}, result['accelerator_resources'])
+
+    def test_numbered_resources_standard_classes_skipped(self):
+        # VCPU/MEMORY_MB/DISK_GB are skipped in numbered groups too.
+        # Arrange
+        extra_specs = {'resources1:VCPU': '4',
+                       'resources1:PGPU': '1'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert
+        self.assertEqual({'PGPU': 1}, result['accelerator_resources'])
+
+    def test_numbered_trait_group_extracted(self):
+        # Arrange
+        extra_specs = {'trait1:CUSTOM_AMD_V620': 'required',
+                       'trait2:HW_NIC_OFFLOAD_TSO': 'forbidden'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert
+        self.assertEqual(['CUSTOM_AMD_V620'], result['required_traits'])
+
+    def test_same_trait_across_groups_deduplicated(self):
+        # Arrange
+        extra_specs = {'trait:CUSTOM_AMD_V620': 'required',
+                       'trait1:CUSTOM_AMD_V620': 'required'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert
+        self.assertEqual(['CUSTOM_AMD_V620'], result['required_traits'])
+
+    def test_traits_suffix_not_confused_with_resources(self):
+        # Keys like 'resourcesX:FOO' (non-digit suffix) are not request
+        # groups and must be ignored.
+        # Arrange
+        extra_specs = {'resourcesX:PGPU': '1',
+                       'traitX:CUSTOM_FOO': 'required'}
+        # Act
+        result = nova.parse_flavor_constraints(extra_specs)
+        # Assert
+        self.assertEqual({}, result['accelerator_resources'])
+        self.assertEqual([], result['required_traits'])
+
 
 class TestFlavorAccessor(tests.TestCase):
     """Tests for nova.FlavorAccessor.get_flavor."""

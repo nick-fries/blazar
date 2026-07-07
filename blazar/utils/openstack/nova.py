@@ -12,6 +12,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 import uuid as uuidgen
 
 from keystoneauth1 import session
@@ -607,8 +608,24 @@ class FlavorAccessor(NovaClientWrapper):
         return standard, dict(extra_specs)
 
 
+#: Nova granular request groups use numbered prefixes
+#: (``resources1:CUSTOM_FOO``, ``trait2:CUSTOM_BAR``) -- the form Cyborg
+#: device profiles and PCI-in-Placement flavors actually generate. The
+#: unnumbered form is matched by the empty group.
+_RESOURCES_SPEC_RE = re.compile(r'^resources(\d*):(.+)$')
+_TRAIT_SPEC_RE = re.compile(r'^trait(\d*):(.+)$')
+
+
 def parse_flavor_constraints(extra_specs):
     """Extract topology-aware reservation inputs from flavor extra specs.
+
+    Both the unnumbered (``resources:``, ``trait:``) and the numbered
+    granular request-group (``resources1:``, ``trait1:``, ...) extra
+    spec forms are recognised. Counts for the same resource class are
+    summed across groups: the pre-flight is a host-level feasibility
+    check, so the aggregate demand is the correct (conservative)
+    quantity regardless of how Nova later splits the groups across
+    sub-RPs.
 
     :param extra_specs: dict from ``Flavor.get_keys()``
     :return: dict with keys
@@ -623,8 +640,10 @@ def parse_flavor_constraints(extra_specs):
     device_profile = None
 
     for key, value in (extra_specs or {}).items():
-        if key.startswith('resources:'):
-            rc = key[len('resources:'):]
+        res_m = _RESOURCES_SPEC_RE.match(key)
+        trait_m = _TRAIT_SPEC_RE.match(key) if res_m is None else None
+        if res_m:
+            rc = res_m.group(2)
             if rc in ('VCPU', 'MEMORY_MB', 'DISK_GB'):
                 # Already covered by the standard fields; skip.
                 continue
@@ -637,9 +656,11 @@ def parse_flavor_constraints(extra_specs):
                 continue
             if count > 0:
                 accel[rc] = accel.get(rc, 0) + count
-        elif key.startswith('trait:'):
+        elif trait_m:
             if str(value).lower() == 'required':
-                traits.append(key[len('trait:'):])
+                trait_name = trait_m.group(2)
+                if trait_name not in traits:
+                    traits.append(trait_name)
         elif key == 'hw:cyborg_locality':
             v = str(value).lower()
             if v in ('socket', 'numa'):

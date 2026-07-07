@@ -395,20 +395,47 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             blob = self._fetch_reservation_accel_blob(r)
             if not blob:
                 continue
-            for rc, count in (blob.get('accelerator_resources') or {}).items():
+            accel_resources = blob.get('accelerator_resources') or {}
+            if not any(rc in committed for rc in accel_resources):
+                continue
+            # ``amount`` is reservation-wide, but host allocations are
+            # one row per instance slot per host (see on_start's
+            # allocation_map). Count only the slots this reservation
+            # actually holds on *this* host, otherwise a multi-host
+            # reservation is charged in full against every candidate
+            # host and the pre-flight rejects hosts that are in fact
+            # feasible. Fall back to the reservation-wide amount only
+            # if the allocation rows cannot be read (conservative).
+            try:
+                slots_here = len(db_api.host_allocation_get_all_by_values(
+                    reservation_id=r.get('id'),
+                    compute_host_id=host_id))
+            except Exception:
+                slots_here = None
+            if slots_here is None:
+                slots_here = int(r.get('instance_reservation', {}).get(
+                    'amount', 1) or 1)
+            if slots_here <= 0:
+                continue
+            for rc, count in accel_resources.items():
                 if rc in committed:
-                    # ``amount`` is reservation-wide; for per-host
-                    # committed accounting, count one instance per host
-                    # the reservation occupies. We don't have a
-                    # per-host slot count cheaply here, so use the most
-                    # conservative thing: the full amount on this host.
-                    # Worst-case this *overcounts*, which is the right
-                    # direction for a pre-flight (it rejects more, not
-                    # fewer, hosts).
-                    amount = r.get('instance_reservation', {}).get(
-                        'amount', 1) or 1
-                    committed[rc] += int(count) * int(amount)
+                    committed[rc] += int(count) * slots_here
         return committed
+
+    def _inject_persisted_accel_constraints(self, reservation, values):
+        """Copy persisted accelerator constraints into a values dict.
+
+        Reads the ``accelerator_constraints`` blob persisted at create
+        time and injects the three pre-flight keys into ``values`` (in
+        place) unless the caller already supplied them. Used by the
+        update and heal paths, which rebuild ``values`` from fixed key
+        lists that do not include the accelerator kwargs.
+        """
+        blob = self._fetch_reservation_accel_blob(reservation) or {}
+        for key in ('accelerator_resources', 'required_traits',
+                    'topology_locality'):
+            if key not in values and blob.get(key):
+                values[key] = blob[key]
 
     @staticmethod
     def _fetch_reservation_accel_blob(reservation):
@@ -878,6 +905,14 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             if key not in new_values:
                 new_values[key] = reservation[key]
 
+        # Re-inject the persisted accelerator constraints so the
+        # pre-flight in query_available_hosts also applies when a
+        # reservation is updated. Without this, pickup_hosts on the
+        # update path would silently drop the accelerator/trait/
+        # topology requirements and could move the lease onto a host
+        # that cannot satisfy them.
+        self._inject_persisted_accel_constraints(reservation, new_values)
+
         changed_hosts = self.pickup_hosts(reservation_id, new_values)
 
         if (reservation['status'] == 'active'
@@ -1089,6 +1124,10 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
                  'resource_properties']
         for key in specs:
             values[key] = reservation[key]
+        # Heal must honour the persisted accelerator constraints too;
+        # otherwise a lease can be healed onto a host that lacks the
+        # accelerators it was reserved for.
+        self._inject_persisted_accel_constraints(reservation, values)
         try:
             changed_hosts = self.pickup_hosts(reservation['id'], values)
         except mgr_exceptions.NotEnoughHostsAvailable:
