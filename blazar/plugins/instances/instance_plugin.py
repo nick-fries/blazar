@@ -184,6 +184,14 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
         return hosts_list
 
     def allocation_candidates(self, reservation):
+        # Gap G2: this path runs before reserve_resource, so a
+        # flavor-only request (flavor_id without explicit
+        # vcpus/memory_mb/disk_gb) would KeyError in pickup_hosts and
+        # the accelerator constraints would be invisible to the
+        # earliest pre-flight. Expand the flavor here exactly like
+        # reserve_resource does; _maybe_apply_flavor is a no-op when
+        # no flavor_id is given.
+        self._maybe_apply_flavor(reservation)
         return self.pickup_hosts(None, reservation)['added']
 
     def list_allocations(self, query):

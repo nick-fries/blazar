@@ -2656,3 +2656,38 @@ class TestReservationFlavorAccelSpecs(tests.TestCase):
             {'accel:device_profile': 'amd-v620-vf',
              'aggregate_instance_extra_specs:reservation': 'res-1',
              'resources:CUSTOM_RESERVATION_RES_1': '1'})
+
+
+class TestAllocationCandidatesFlavorExpansion(tests.TestCase):
+    """Gap G2: allocation_candidates must expand flavor_id like
+    reserve_resource does, so flavor-only lease requests work and the
+    accelerator constraints reach the earliest pre-flight."""
+
+    def setUp(self):
+        super(TestAllocationCandidatesFlavorExpansion, self).setUp()
+        self.plugin = instance_plugin.VirtualInstancePlugin()
+
+    def test_allocation_candidates_expands_flavor(self):
+        values = {'flavor_id': 'flavor-1', 'amount': 1, 'affinity': None,
+                  'resource_properties': '',
+                  'start_date': datetime.datetime(2030, 1, 1, 8),
+                  'end_date': datetime.datetime(2030, 1, 1, 9)}
+        with mock.patch.object(self.plugin,
+                               '_maybe_apply_flavor') as m_apply, \
+                mock.patch.object(self.plugin, 'pickup_hosts') as m_pick:
+            m_pick.return_value = {'added': ['host-1'], 'removed': []}
+            ret = self.plugin.allocation_candidates(values)
+        m_apply.assert_called_once_with(values)
+        m_pick.assert_called_once_with(None, values)
+        self.assertEqual(['host-1'], ret)
+
+    def test_allocation_candidates_no_flavor_unchanged(self):
+        values = {'vcpus': 2, 'memory_mb': 1024, 'disk_gb': 10,
+                  'amount': 1, 'affinity': None, 'resource_properties': '',
+                  'start_date': datetime.datetime(2030, 1, 1, 8),
+                  'end_date': datetime.datetime(2030, 1, 1, 9)}
+        with mock.patch.object(nova, 'FlavorAccessor') as m_fa, \
+                mock.patch.object(self.plugin, 'pickup_hosts') as m_pick:
+            m_pick.return_value = {'added': [], 'removed': []}
+            self.plugin.allocation_candidates(values)
+        m_fa.assert_not_called()
