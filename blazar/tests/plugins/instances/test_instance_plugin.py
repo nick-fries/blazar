@@ -2658,36 +2658,152 @@ class TestReservationFlavorAccelSpecs(tests.TestCase):
              'resources:CUSTOM_RESERVATION_RES_1': '1'})
 
 
-class TestAllocationCandidatesFlavorExpansion(tests.TestCase):
-    """Gap G2: allocation_candidates must expand flavor_id like
-    reserve_resource does, so flavor-only lease requests work and the
-    accelerator constraints reach the earliest pre-flight."""
+class TestAccelSlotCap(tests.TestCase):
+    """G2 fix: per-host candidate slots are capped by accelerator
+    capacity so amount > capacity raises NotEnoughHostsAvailable."""
 
-    def setUp(self):
-        super(TestAllocationCandidatesFlavorExpansion, self).setUp()
-        self.plugin = instance_plugin.VirtualInstancePlugin()
+    def _build_plugin(self, hosts, placement_state):
+        mock_host_get_query = self.patch(
+            db_api, 'reservable_host_get_all_by_queries')
+        mock_host_get_query.return_value = hosts
+        self.patch(db_utils, 'get_reservations_by_host_id').return_value = []
+        plugin = instance_plugin.VirtualInstancePlugin()
+        plugin.placement_client = FakePlacementClient(placement_state)
+        return plugin
 
-    def test_allocation_candidates_expands_flavor(self):
-        values = {'flavor_id': 'flavor-1', 'amount': 1, 'affinity': None,
-                  'resource_properties': '',
-                  'start_date': datetime.datetime(2030, 1, 1, 8),
-                  'end_date': datetime.datetime(2030, 1, 1, 9)}
-        with mock.patch.object(self.plugin,
-                               '_maybe_apply_flavor') as m_apply, \
-                mock.patch.object(self.plugin, 'pickup_hosts') as m_pick:
-            m_pick.return_value = {'added': ['host-1'], 'removed': []}
-            ret = self.plugin.allocation_candidates(values)
-        m_apply.assert_called_once_with(values)
-        m_pick.assert_called_once_with(None, values)
-        self.assertEqual(['host-1'], ret)
+    def _h(self, host_id, name='compute-01'):
+        return {'id': host_id, 'hypervisor_hostname': name,
+                'vcpus': 16, 'memory_mb': 65536, 'local_gb': 1000}
 
-    def test_allocation_candidates_no_flavor_unchanged(self):
-        values = {'vcpus': 2, 'memory_mb': 1024, 'disk_gb': 10,
-                  'amount': 1, 'affinity': None, 'resource_properties': '',
-                  'start_date': datetime.datetime(2030, 1, 1, 8),
-                  'end_date': datetime.datetime(2030, 1, 1, 9)}
-        with mock.patch.object(nova, 'FlavorAccessor') as m_fa, \
-                mock.patch.object(self.plugin, 'pickup_hosts') as m_pick:
-            m_pick.return_value = {'added': [], 'removed': []}
-            self.plugin.allocation_candidates(values)
-        m_fa.assert_not_called()
+    def _query(self, plugin, **overrides):
+        kwargs = {
+            'cpus': 4,
+            'memory': 8192,
+            'disk': 20,
+            'resource_properties': '',
+            'start_date': datetime.datetime(2030, 1, 1, 8, 0),
+            'end_date': datetime.datetime(2030, 1, 1, 12, 0),
+        }
+        kwargs.update(overrides)
+        return plugin.query_available_hosts(**kwargs)
+
+    def test_slots_capped_by_pgpu_capacity(self):
+        # Host bin-packs to 4 slots by CPU (16/4) but has only 2 PGPU.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        self.assertEqual(2, len(ret))
+
+    def test_slots_not_capped_without_accel_constraint(self):
+        # Same host, no accelerator constraint: CPU bin-pack rules (4).
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        ret = self._query(plugin)
+        self.assertEqual(4, len(ret))
+
+    def test_used_reduces_slot_cap(self):
+        # total=2 used=1 -> effective=1 -> exactly one slot.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 1}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        self.assertEqual(1, len(ret))
+
+    def test_committed_reduces_slot_cap(self):
+        # total=2, one PGPU committed to an overlapping reservation ->
+        # only one candidate slot survives.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        self.patch(plugin, '_committed_accel_for_host').return_value = {
+            'PGPU': 1}
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        self.assertEqual(1, len(ret))
+
+    def test_committed_exhausts_capacity_rejects_host(self):
+        # total=2, 2 committed -> effective 0 -> host excluded entirely.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        self.patch(plugin, '_committed_accel_for_host').return_value = {
+            'PGPU': 2}
+        ret = self._query(plugin, accelerator_resources={'PGPU': 1})
+        self.assertEqual([], ret)
+
+    def test_per_instance_requirement_divides_cap(self):
+        # 4 PGPUs, each instance needs 2 -> cap = 2 slots.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 4, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        ret = self._query(plugin, accelerator_resources={'PGPU': 2})
+        self.assertEqual(2, len(ret))
+
+    def test_accel_admission_returns_cap(self):
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 2, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        constraints = {'accelerator_resources': {'PGPU': 1},
+                       'required_traits': [],
+                       'topology_locality': None}
+        admit, cap = plugin._accel_admission(
+            host, [], constraints,
+            datetime.datetime(2030, 1, 1, 8, 0),
+            datetime.datetime(2030, 1, 1, 12, 0), [])
+        self.assertTrue(admit)
+        self.assertEqual(2, cap)
+
+    def test_accel_admission_traits_only_unbounded(self):
+        # Traits-only constraint: admitted with no slot cap.
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {},
+                            'anchors': set(),
+                            'subtree_traits': {'CUSTOM_AMD_V620_VF'}}})
+        constraints = {'accelerator_resources': {},
+                       'required_traits': ['CUSTOM_AMD_V620_VF'],
+                       'topology_locality': None}
+        admit, cap = plugin._accel_admission(
+            host, [], constraints,
+            datetime.datetime(2030, 1, 1, 8, 0),
+            datetime.datetime(2030, 1, 1, 12, 0), [])
+        self.assertTrue(admit)
+        self.assertIsNone(cap)
+
+    def test_host_satisfies_accel_wrapper_bool(self):
+        host = self._h('h1', 'compute-01')
+        plugin = self._build_plugin(
+            [host],
+            {'compute-01': {'inventory': {'PGPU': {'total': 0, 'used': 0}},
+                            'anchors': set(),
+                            'subtree_traits': set()}})
+        constraints = {'accelerator_resources': {'PGPU': 1},
+                       'required_traits': [],
+                       'topology_locality': None}
+        self.assertFalse(plugin._host_satisfies_accel(
+            host, [], constraints,
+            datetime.datetime(2030, 1, 1, 8, 0),
+            datetime.datetime(2030, 1, 1, 12, 0), []))

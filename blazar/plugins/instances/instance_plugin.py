@@ -184,14 +184,6 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
         return hosts_list
 
     def allocation_candidates(self, reservation):
-        # Gap G2: this path runs before reserve_resource, so a
-        # flavor-only request (flavor_id without explicit
-        # vcpus/memory_mb/disk_gb) would KeyError in pickup_hosts and
-        # the accelerator constraints would be invisible to the
-        # earliest pre-flight. Expand the flavor here exactly like
-        # reserve_resource does; _maybe_apply_flavor is a no-op when
-        # no flavor_id is given.
-        self._maybe_apply_flavor(reservation)
         return self.pickup_hosts(None, reservation)['added']
 
     def list_allocations(self, query):
@@ -297,11 +289,21 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
         available_hosts = []
         for host_info in (reserved_hosts + free_hosts):
             host = host_info['host']
-            if accel_constraints and not self._host_satisfies_accel(
+            slot_cap = None
+            if accel_constraints:
+                admit, slot_cap = self._accel_admission(
                     host, host_info['reservations'], accel_constraints,
-                    start_date, end_date, excludes_res):
-                continue
+                    start_date, end_date, excludes_res)
+                if not admit:
+                    continue
             hosts_list = self.get_hosts_list(host_info, cpus, memory, disk)
+            if slot_cap is not None and len(hosts_list) > slot_cap:
+                LOG.debug(
+                    "Host %s: capping candidate slots %d -> %d by "
+                    "accelerator capacity.",
+                    host.get('hypervisor_hostname') or host.get('id'),
+                    len(hosts_list), slot_cap)
+                hosts_list = hosts_list[:slot_cap]
             available_hosts.extend(hosts_list)
 
         return available_hosts
@@ -325,22 +327,40 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
 
     def _host_satisfies_accel(self, host, host_reservations, constraints,
                               start_date, end_date, excludes_res):
+        """Boolean wrapper around :py:meth:`_accel_admission`."""
+        return self._accel_admission(
+            host, host_reservations, constraints,
+            start_date, end_date, excludes_res)[0]
+
+    def _accel_admission(self, host, host_reservations, constraints,
+                         start_date, end_date, excludes_res):
         """Apply accelerator/trait/topology constraints to one host.
 
         :param host: row from blazar.db (has 'hypervisor_hostname')
         :param host_reservations: list of Reservation objects in window
         :param constraints: dict from :py:meth:`_normalise_accel_constraints`
-        :return: True iff this host can satisfy the constraints.
+        :return: tuple ``(admit, slot_cap)``.
+
+            ``admit`` is True iff this host can satisfy the constraints
+            for at least one instance.
+
+            ``slot_cap`` is the maximum number of instances of this
+            reservation the host's effective accelerator capacity can
+            hold (inventory minus placement 'used' minus capacity
+            committed to overlapping Blazar reservations), or ``None``
+            when no accelerator-resource constraint applies (traits or
+            topology only, gate disabled, or no placement identity).
+            Callers must cap per-host candidate slots at ``slot_cap`` so
+            that multi-instance reservations (amount > 1) cannot be
+            admitted beyond real accelerator capacity (G2 fix).
         """
         if not CONF.scheduler.accelerator_aware:
-            return True
-
+            return True, None
         host_name = host.get('hypervisor_hostname') or host.get('name')
         if not host_name:
             LOG.debug("Host row %s has no hypervisor_hostname; "
                       "skipping accelerator pre-flight.", host.get('id'))
-            return True
-
+            return True, None
         try:
             rp_tree = self.placement_client.get_host_rp_tree(host_name)
         except Exception as exc:
@@ -348,12 +368,11 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
                 "Placement RP-tree read failed for host %s: %s. "
                 "Excluding from accelerator-aware candidates.",
                 host_name, exc)
-            return False
-
+            return False, 0
         if not rp_tree:
             # Host has no RP at all -- can't be a candidate when
             # accelerator constraints are in play.
-            return False
+            return False, 0
 
         # Required traits: union of traits across non-Blazar sub-RPs
         # must include every required trait.
@@ -361,19 +380,22 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
             if not self.placement_client.host_subtree_has_traits(
                     host_name, constraints['required_traits'],
                     rp_tree=rp_tree):
-                return False
+                return False, 0
 
         # Topology anchor: at least one sub-RP carries the anchor trait.
         loc = constraints['topology_locality']
         if loc is not None:
             anchor_trait = TOPOLOGY_ANCHOR_TRAITS.get(loc)
             if anchor_trait is None:
-                return False
+                return False, 0
             if not self.placement_client.host_has_anchor(
                     host_name, anchor_trait, rp_tree=rp_tree):
-                return False
+                return False, 0
 
-        # Accelerator inventory: effective availability >= required.
+        # Accelerator inventory: effective availability >= required,
+        # and per-host slot capacity = min over resource classes of
+        # (effective // required-per-instance).
+        slot_cap = None
         accel = constraints['accelerator_resources']
         if accel:
             inv = self.placement_client.get_accelerator_inventory_for_host(
@@ -382,6 +404,8 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
                 host['id'], host_reservations, accel.keys(),
                 start_date, end_date, excludes_res)
             for rc, required in accel.items():
+                if required <= 0:
+                    continue
                 total = inv.get(rc, {}).get('total', 0)
                 used = inv.get(rc, {}).get('used', 0)
                 effective = total - used - committed.get(rc, 0)
@@ -391,8 +415,11 @@ class VirtualInstancePlugin(base.BasePlugin, nova.NovaClientWrapper):
                         "(total=%s used=%s committed=%s)",
                         host_name, rc, effective, required,
                         total, used, committed.get(rc, 0))
-                    return False
-        return True
+                    return False, 0
+                rc_cap = effective // required
+                if slot_cap is None or rc_cap < slot_cap:
+                    slot_cap = rc_cap
+        return True, slot_cap
 
     def _committed_accel_for_host(self, host_id, host_reservations,
                                   resource_classes, start_date, end_date,
